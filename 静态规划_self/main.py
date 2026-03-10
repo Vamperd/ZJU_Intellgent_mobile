@@ -26,12 +26,21 @@ if __name__ == '__main__':
             while start_x < -10000:
                 start_x, start_y = vision.my_robot.x, vision.my_robot.y # 记录起点
             print(start_x, start_y)
-            path_x, path_y, road_map, sample_x, sample_y = planner.plan(vision=vision, 
-                start_x=start_x, start_y=start_y, goal_x=goal_x, goal_y=goal_y)
+            
+            # 创建可视化回调函数，展示规划过程
+            visual_callback = debugger.create_visual_callback(start_x, start_y, goal_x, goal_y)
+            
+            path_x, path_y, road_map, sample_x, sample_y = planner.plan(
+                vision=vision, 
+                start_x=start_x, 
+                start_y=start_y, 
+                goal_x=goal_x, 
+                goal_y=goal_y,
+                visual_callback=visual_callback
+            )
 
-        # 呈现路径
+        # 呈现路径（已在规划过程中通过可视化回调显示）
         print('get path')
-        debugger.draw_all(sample_x, sample_y, road_map, path_x, path_y)
 
         # velocity planning
         point_num = len(path_x)-1
@@ -52,8 +61,8 @@ if __name__ == '__main__':
                         break
                 vx, vw = move.get_action(vision, path_x, path_y, Next_point_index, direction=1)
                 # 发送指令
-                action.sendCommand(vx=1.2*vx/(1+2*abs(vw)), vw=vw)
-                time.sleep(0.1)
+                action.sendCommand(vx=1.2*vx/(1+0.5*abs(vw)), vw=vw)
+                time.sleep(0.05)  # 减小延时，提高控制频率
 
             move.turn_arround(action, vision)
             # 反向
@@ -71,7 +80,7 @@ if __name__ == '__main__':
                         break
                 vx, vw = move.get_action(vision, path_x, path_y, Next_point_index, direction=-1)
                 # 发送指令
-                action.sendCommand(vx=1.2*vx/(1+2*abs(vw)), vw=vw)
+                action.sendCommand(vx=1.2*vx/(1+0.5*abs(vw)), vw=vw)
                 time.sleep(0.1)
             move.turn_arround(action, vision)      
 

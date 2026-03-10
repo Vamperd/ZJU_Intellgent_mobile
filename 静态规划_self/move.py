@@ -35,12 +35,12 @@ def PID_vx(vx_error, vx_error_sum, vx_error_last, flag):
     output = Kp * vx_error + Ki * vx_error_sum + Kd * vx_error_last
     if flag:
         output = function(output)
-        output = max(output, 1000)
+        output = max(output, 1200)
     else:
         output = function(output)
-        output = max(output, 500)
-    if output > 3000:
-        output = 3000
+        output = max(output, 450)
+    if output > 4000:
+        output = 4000
     return output
 
 def PID_vw(vw_error, vw_error_sum, vw_error_last):
