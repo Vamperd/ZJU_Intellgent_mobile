@@ -2,781 +2,735 @@
 
 ## 1. 项目概述
 
-本项目是一个基于 Python 的二维机器人导航与路径规划实验程序，运行场景明显面向 RoboCup/小型组足球仿真或类似的平面机器人平台。程序通过 UDP 从视觉模块接收场上机器人状态，基于当前障碍物分布进行路径规划，再将速度指令发送给 0 号蓝车，并通过调试通道把采样点、路线图和最终路径可视化。
+本项目是一个基于 Python 的二维机器人导航与路径规划实验程序，面向 RoboCup/小型组足球仿真平台。程序通过 UDP 从视觉模块接收场上机器人状态，基于当前障碍物分布进行路径规划，再将速度指令发送给机器人。
 
-从代码结构看，它实现的是一套“感知 - 规划 - 跟踪 - 控制 - 可视化”的闭环流程：
-
-- `vision.py`：接收视觉数据，维护场上机器人状态。
-- `rrt.py` / `prm.py`：根据障碍物位置进行路径规划。
-- `move.py`：沿规划路径生成线速度和角速度控制量。
-- `action.py`：向仿真器/控制端发送运动指令。
-- `debug.py`：把规划结果绘制到调试界面。
-- `main.py`：主程序，串联整个导航流程。
-
-需要特别说明的是：项目中虽然同时提供了 PRM 和 RRT 两种路径规划实现，但 `main.py` 当前实际启用的是 `RRT()`。
+核心模块：
+- `vision.py`：接收视觉数据，维护场上机器人状态
+- `rrt.py`：RRT* 路径规划算法
+- `move.py`：PID 路径跟踪控制
+- `action.py`：发送运动指令
+- `debug.py`：规划结果可视化
+- `main.py`：主程序，串联整个导航流程
 
 ---
 
-## 2. 这个项目完成了什么
+## 2. RRT* 路径规划算法
 
-该程序的核心目标是：
+### 2.1 算法背景与原理
 
-1. 获取机器人和其他机器人的实时位置；
-2. 将其他机器人视为动态场景中的瞬时障碍物；
-3. 从己方机器人当前位置规划到目标点的无碰撞路径；
-4. 沿路径逐点跟踪，持续发送速度控制指令；
-5. 到达终点后原地调头，再沿同一路径反向返回；
-6. 重复若干次往返运动。
+**RRT（快速扩展随机树）** 是一种基于采样的路径规划算法，通过从起点开始逐步构建一棵搜索树来探索空间。RRT 的优点是能够高效处理高维空间和复杂障碍物环境，但缺点是找到的路径往往不是最优的。
 
-在 `main.py` 中，目标点被设为 `(-2400, -1500)`，默认往返次数 `loop_count = 5`。因此程序行为并不是单次“到点即停”，而是“规划一次路径后，沿路径往返巡航多次”。
+**RRT*** 是 RRT 的优化版本，由 Sertac Karaman 和 Emilio Frazzoli 在 2010 年提出。RRT* 引入了两个关键机制：
+
+1. **最优父节点选择**：新节点加入树时，从多个邻居中选择代价最小的作为父节点
+2. **重布线（Rewiring）**：检查已有节点是否通过新节点可以获得更小代价，若是则重新连接
+
+这两个机制使得 RRT* 具有**渐近最优性**——随着采样点数量增加，路径代价会收敛到最优值。
+
+### 2.2 核心数据结构
+
+```python
+class Node:
+    def __init__(self, x, y, cost, parent):
+        self.x = x          # 节点x坐标
+        self.y = y          # 节点y坐标
+        self.cost = cost    # 从起点到该节点的累计代价
+        self.parent = parent  # 父节点索引
+```
+
+树的表示方式：
+- `sample_x[], sample_y[]`：所有节点的坐标数组
+- `parent_index[]`：每个节点的父节点索引（根节点为 -1）
+- `cost[]`：每个节点的累计代价
+
+### 2.3 算法整体流程
+
+```
+RRT* 主循环：
+while iteration < MAX_ITER:
+    1. 随机采样目标点 Q_rand
+    2. 找到树中最近节点 Q_nearest
+    3. 沿方向扩展固定步长得到 Q_new
+    4. 碰撞检测
+    5. [RRT*特有] 搜索邻居节点
+    6. [RRT*特有] 选择最优父节点
+    7. 添加新节点到树
+    8. [RRT*特有] 重布线优化
+    9. 尝试连接目标点
+```
+
+### 2.4 详细实现步骤
+
+#### 2.4.1 障碍物初始化
+
+```python
+def plan(self, vision, start_x, start_y, goal_x, goal_y, visual_callback=None):
+    # 从视觉系统提取障碍物位置
+    obstacle_x = [-9999]
+    obstacle_y = [-9999]
+    for robot_blue in vision.blue_robot:
+        if robot_blue.visible and robot_blue.id > 0:  # 排除己方0号车
+            obstacle_x.append(robot_blue.x)
+            obstacle_y.append(robot_blue.y)
+    for robot_yellow in vision.yellow_robot:
+        if robot_yellow.visible:
+            obstacle_x.append(robot_yellow.x)
+            obstacle_y.append(robot_yellow.y)
+    
+    # 使用 KDTree 构建障碍物空间索引，加速最近邻查询
+    obstree = KDTree(np.vstack((obstacle_x, obstacle_y)).T)
+```
+
+障碍物建模说明：
+- 蓝方机器人：仅将 `id > 0` 的可见车辆视为障碍（0号车是己方）
+- 黄方机器人：所有可见车辆都视为障碍
+- 安全膨胀半径：`robot_size + avoid_dist = 200 + 200 = 400`
+
+#### 2.4.2 目标偏置采样
+
+```python
+def sampling(self, start_x, start_y, goal_x, goal_y, obstree):
+    while iteration < self.MAX_ITER:
+        # 目标偏置采样：15% 概率直接采样目标点
+        random_num = random.random()
+        if random_num < 0.15:
+            Q_rand_x = goal_x
+            Q_rand_y = goal_y
+        else:
+            # 85% 概率在场地范围内随机采样
+            Q_rand_x = (random.random() * (self.maxx - self.minx)) + self.minx
+            Q_rand_y = (random.random() * (self.maxy - self.miny)) + self.miny
+```
+
+目标偏置的作用：
+- **加速收敛**：直接朝目标扩展可以更快找到可行路径
+- **保持探索性**：大部分时候随机采样，保证对空间的充分探索
+- **平衡策略**：15% 的偏置率是经验值，过大会降低探索能力，过小会减慢收敛
+
+#### 2.4.3 最近邻查找与扩展
+
+```python
+# 每轮迭代重建节点 KDTree
+Nodetree = KDTree(np.vstack((sample_x, sample_y)).T)
+
+# 找到离采样点最近的树节点
+distance, nearest_idx = Nodetree.query(np.array([Q_rand_x, Q_rand_y]))
+Q_nearest_x, Q_nearest_y = sample_x[nearest_idx], sample_y[nearest_idx]
+
+# 固定步长扩展
+def extend(self, Q_nearest_x, Q_nearest_y, Q_rand_x, Q_rand_y):
+    dy = Q_rand_y - Q_nearest_y
+    dx = Q_rand_x - Q_nearest_x
+    theta = math.atan2(dy, dx)  # 计算方向角
+    Q_new_x = Q_nearest_x + 1000 * math.cos(theta)
+    Q_new_y = Q_nearest_y + 1000 * math.sin(theta)
+    return Q_new_x, Q_new_y
+```
+
+扩展策略说明：
+- 使用 `atan2` 计算方向角，能正确处理所有象限
+- 固定步长 1000 可以平衡树的稠密程度和计算效率
+- 步长过大会增加碰撞概率，过小会降低探索效率
+
+#### 2.4.4 RRT* 核心：邻居搜索
+
+```python
+def find_near_nodes(self, tree, x, y, n):
+    """查找新节点周围的邻居节点"""
+    # RRT* 标准动态半径公式
+    # γ 应大于场地对角线/√π，这里取 5000
+    gamma = 5000
+    # d=2 为空间维度
+    radius = gamma * math.sqrt(math.log(n + 1) / (n + 1))
+    # 不超过最大搜索半径
+    radius = min(radius, self.SEARCH_RADIUS)  # SEARCH_RADIUS = 1500
+    # 设置最小半径避免搜索范围过小
+    if radius < 300:
+        radius = 300
+    
+    # 使用 KDTree 的球查询
+    indices = tree.query_ball_point([x, y], radius)
+    return list(indices)
+```
+
+动态搜索半径的数学原理：
+
+RRT* 的渐近最优性要求搜索半径满足：
+$$r_n = \gamma \cdot \left(\frac{\log n}{n}\right)^{1/d}$$
+
+其中：
+- $n$ 是当前节点数
+- $d$ 是空间维度（二维空间 $d=2$）
+- $\gamma$ 是常数，需满足 $\gamma > \gamma_{RRT^*} = 2\left(1+\frac{1}{d}\right)^{1/d}\left(\frac{\mu(X_{free})}{\zeta_d}\right)^{1/d}$
+
+这个公式的意义：
+- 随着节点数增加，搜索半径逐渐减小
+- 保证每个新节点能够找到足够多的邻居进行优化
+- 同时控制计算复杂度在合理范围内
+
+#### 2.4.5 RRT* 核心：最优父节点选择
+
+```python
+def choose_parent(self, new_x, new_y, neighbor_indices, sample_x, sample_y, cost, obstree):
+    """在邻居中选择代价最小的作为父节点"""
+    best_parent = None
+    best_cost = float('inf')
+    
+    for idx in neighbor_indices:
+        px, py = sample_x[idx], sample_y[idx]
+        
+        # 检查连线是否无碰撞
+        if not self.check_obs(px, py, new_x, new_y, obstree):
+            edge_cost = math.hypot(new_x - px, new_y - py)
+            total_cost = cost[idx] + edge_cost  # 父节点代价 + 边代价
+            
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_parent = idx
+    
+    return best_parent, best_cost
+```
+
+选择逻辑：
+1. 遍历搜索半径内的所有邻居节点
+2. 对每个邻居，计算通过它到达新节点的总代价
+3. 只有无碰撞的连线才被考虑
+4. 选择总代价最小的邻居作为父节点
+
+与普通 RRT 的区别：
+- **普通 RRT**：直接选择最近的节点作为父节点
+- **RRT***：从所有可达邻居中选择代价最小的，可能不是最近节点
+
+#### 2.4.6 RRT* 核心：重布线（Rewiring）
+
+```python
+def rewire(self, new_x, new_y, new_idx, neighbor_indices, 
+           sample_x, sample_y, cost, parent_index, obstree):
+    """重布线：检查邻居是否通过新节点可以获得更小代价"""
+    for idx in neighbor_indices:
+        if idx == new_idx:
+            continue
+        
+        px, py = sample_x[idx], sample_y[idx]
+        edge_cost = math.hypot(new_x - px, new_y - py)
+        potential_cost = cost[new_idx] + edge_cost  # 通过新节点的代价
+        
+        # 如果通过新节点代价更小，且连线无碰撞
+        if potential_cost < cost[idx]:
+            if not self.check_obs(new_x, new_y, px, py, obstree):
+                cost[idx] = potential_cost      # 更新代价
+                parent_index[idx] = new_idx     # 更新父节点
+```
+
+重布线的意义：
+
+重布线是 RRT* 实现渐近最优性的关键。当一个新节点加入树后，它不仅作为后续节点的潜在父节点，还会回过头优化已有节点的连接方式。
+
+示例说明：
+```
+假设树结构：
+    A -----> B (cost=10)
+    
+新节点 C 加入后，发现 A -> C -> B 的代价是 8
+    A --C--> B (cost=8)
+    
+重布线会将 B 的父节点从 A 改为 C
+```
+
+重布线的效果：
+- 随着迭代进行，树的拓扑结构会不断优化
+- 路径会变得越来越短、越来越平滑
+- 最终收敛到近似最优路径
+
+#### 2.4.7 碰撞检测
+
+```python
+def check_obs(self, ix, iy, nx, ny, obstree):
+    """检测两点之间的连线是否与障碍物碰撞"""
+    x, y = ix, iy
+    dx = nx - ix
+    dy = ny - iy
+    angle = math.atan2(dy, dx)
+    dis = math.hypot(dx, dy)
+
+    # 边长超过阈值直接判定碰撞
+    if dis > self.MAX_EDGE_LEN:
+        return True
+
+    # 离散步进检测
+    step_size = self.robot_size + self.avoid_dist  # 400
+    steps = round(dis / step_size)
+    
+    for i in range(steps):
+        distance, index = obstree.query(np.array([x, y]))
+        if distance <= self.robot_size + self.avoid_dist:
+            return True  # 碰撞
+        x += step_size * math.cos(angle)
+        y += step_size * math.sin(angle)
+
+    # 检查终点
+    distance, index = obstree.query(np.array([nx, ny]))
+    if distance <= 100:
+        return True
+
+    return False  # 无碰撞
+```
+
+碰撞检测策略：
+- 采用离散采样方式近似连续碰撞检测
+- 步长等于安全距离，确保不会遗漏碰撞
+- 使用 KDTree 快速查询最近障碍物距离
+
+#### 2.4.8 目标点连接与持续优化
+
+```python
+# 在主循环中，尝试从新节点连接到目标
+goal_dist = math.hypot(Q_new_x - goal_x, Q_new_y - goal_y)
+if not self.check_obs(Q_new_x, Q_new_y, goal_x, goal_y, obstree):
+    new_goal_cost = cost[new_node_idx] + goal_dist
+    
+    if goal_node_idx == -1:
+        # 第一次到达目标
+        goal_node_idx = len(sample_x)
+        sample_x.append(goal_x)
+        sample_y.append(goal_y)
+        parent_index.append(new_node_idx)
+        cost.append(new_goal_cost)
+        best_goal_cost = new_goal_cost
+        print(f"Goal reached at iteration {iteration}, cost: {best_goal_cost:.0f}")
+    elif new_goal_cost < best_goal_cost:
+        # 找到更好的路径
+        best_goal_cost = new_goal_cost
+        parent_index[goal_node_idx] = new_node_idx
+        cost[goal_node_idx] = new_goal_cost
+
+# 到达目标后继续优化
+if goal_node_idx != -1:
+    post_goal_iterations -= 1
+    if post_goal_iterations <= 0:
+        print(f"Optimization finished. Final cost: {cost[goal_node_idx]:.0f}")
+        break
+```
+
+持续优化策略：
+- 第一次到达目标后不立即停止
+- 继续迭代 300 次，寻找更优路径
+- 通过重布线机制，后续迭代可能找到代价更低的路径
+
+### 2.5 路径后处理
+
+#### 2.5.1 路径剪枝（Path Pruning）
+
+```python
+def smooth_path(self, path_x, path_y, obstree, visual_callback=None):
+    """路径剪枝：跳过可直接连通的中间节点，减少转角"""
+    if len(path_x) <= 2:
+        return path_x, path_y
+    
+    smoothed_x, smoothed_y = [path_x[0]], [path_y[0]]
+    i = 0
+    
+    while i < len(path_x) - 1:
+        # 从远到近尝试跳过中间节点
+        for j in range(len(path_x) - 1, i, -1):
+            if not self.check_obs(path_x[i], path_y[i], path_x[j], path_y[j], obstree):
+                # 找到可以跳过的节点
+                smoothed_x.append(path_x[j])
+                smoothed_y.append(path_y[j])
+                i = j
+                break
+        else:
+            i += 1
+            if i < len(path_x):
+                smoothed_x.append(path_x[i])
+                smoothed_y.append(path_y[i])
+    
+    return smoothed_x, smoothed_y
+```
+
+剪枝算法说明：
+- **贪心策略**：从当前位置尝试跳到最远的可达节点
+- **减少转角**：跳过不必要的中间节点，使路径更直接
+- **保持安全**：每次跳跃都要进行碰撞检测
+
+#### 2.5.2 路径插值平滑
+
+```python
+def interpolate_path(self, path_x, path_y, obstree, interval=400):
+    """路径插值平滑：在路径节点间插入中间点"""
+    if len(path_x) <= 1:
+        return path_x, path_y
+    
+    new_x, new_y = [path_x[0]], [path_y[0]]
+    
+    for i in range(len(path_x) - 1):
+        x1, y1 = path_x[i], path_y[i]
+        x2, y2 = path_x[i + 1], path_y[i + 1]
+        
+        dist = math.hypot(x2 - x1, y2 - y1)
+        if dist > interval:
+            # 插入中间点
+            num_points = int(dist / interval)
+            for j in range(1, num_points + 1):
+                ratio = j / (num_points + 1)
+                interp_x = x1 + ratio * (x2 - x1)
+                interp_y = y1 + ratio * (y2 - y1)
+                # 检查插值点安全性
+                col_dist, _ = obstree.query([interp_x, interp_y])
+                if col_dist >= self.robot_size + self.avoid_dist:
+                    new_x.append(interp_x)
+                    new_y.append(interp_y)
+        
+        new_x.append(x2)
+        new_y.append(y2)
+    
+    return new_x, new_y
+```
+
+插值的作用：
+- **增加路径点密度**：便于控制器更精细地跟踪
+- **平滑轨迹**：减少相邻路径点之间的角度变化
+- **安全验证**：每个插值点都经过碰撞检测
+
+### 2.6 关键参数说明
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `MAX_ITER` | 3000 | 最大迭代次数，控制规划时间上限 |
+| `SEARCH_RADIUS` | 1500 | 最大邻居搜索半径，限制重布线范围 |
+| `N_SAMPLE` | 100 | 采样点数量（PRM使用） |
+| `KNN` | 10 | 每节点最大邻居数（PRM使用） |
+| `MAX_EDGE_LEN` | 5000 | 最大边长，超过则判定不可达 |
+| `robot_size` | 200 | 机器人本体半径（mm） |
+| `avoid_dist` | 200 | 额外安全距离（mm） |
+| 扩展步长 | 1000 | 每次扩展的固定距离（mm） |
+| 目标偏置率 | 15% | 直接采样目标点的概率 |
+| 场地范围 | x: [-4500, 4500], y: [-3000, 3000] | 单位：mm |
+
+### 2.7 RRT* vs 普通 RRT 对比
+
+| 特性 | 普通 RRT | RRT* |
+|------|----------|------|
+| 父节点选择 | 最近节点 | 代价最小的邻居 |
+| 路径优化 | 无 | 重布线机制 |
+| 路径质量 | 可行解 | 渐近最优 |
+| 计算复杂度 | O(n log n) | O(n log n) 但常数更大 |
+| 适用场景 | 快速响应 | 需要高质量路径 |
 
 ---
 
-## 3. 项目目录与模块职责
+## 3. Move 路径跟踪控制
 
-### 3.1 主流程模块
+### 3.1 控制架构
 
-#### `main.py`
+Move 模块实现了**航点跟踪（Waypoint Tracking）**控制策略，将规划生成的离散路径点序列转化为机器人的速度指令。
 
-主程序入口，负责：
-
-- 初始化视觉、控制、调试、规划器对象；
-- 等待视觉模块给出己方机器人当前位置；
-- 调用规划器生成路径；
-- 调用调试器显示采样点、路网和最终路径；
-- 使用 `Move` 控制器逐点跟踪路径；
-- 在路径两端执行掉头，并进行往返运动。
-
-它相当于整个系统的任务调度器。
-
-### 3.2 感知模块
-
-#### `vision.py`
-
-该文件通过 UDP 端口 `23333` 接收视觉系统发送的 protobuf 数据帧，并把数据解析为本地可访问的机器人对象列表。
-
-主要职责：
-
-- 启动后台线程持续接收视觉消息；
-- 解析蓝方、黄方机器人位置、速度、朝向；
-- 将 `blue_robot[0]` 暴露为 `my_robot`，作为本车状态；
-- 每次收到新帧时刷新可见性与状态。
-
-这里的设计使得规划器和控制器都可以直接读取 `vision.my_robot.x`、`vision.my_robot.y`、`vision.my_robot.orientation` 等实时信息。
-
-### 3.3 控制模块
-
-#### `action.py`
-
-该文件负责通过 UDP 向 `localhost:50001` 发送运动控制命令。命令中指定：
-
-- `robot_id = 0`
-- 前向速度 `velocity_x`
-- 横向速度 `velocity_y`
-- 角速度 `velocity_r`
-
-当前主程序只使用了前向速度 `vx` 和角速度 `vw`，`vy` 始终保持默认值 0，因此系统采用的是“差速/类单车模型”的简化平面控制方式，而不是全向运动控制。
-
-### 3.4 调试可视化模块
-
-#### `debug.py`
-
-该文件通过 UDP 向 `localhost:20001` 发送调试绘图消息，支持画点、画线、画圆、画路线图、画最终路径。
-
-其中最关键的方法是：
-
-- `draw_points(...)`：绘制采样点；
-- `draw_roadmap(...)`：绘制采样点之间的连边；
-- `draw_finalpath(...)`：用绿色线段绘制最终路径；
-- `draw_all(...)`：一次性输出全部规划结果。
-
-因此，规划不是“黑盒运行”，而是能够直观看到采样结果、连通结构和最终路线。
-
-### 3.5 路径跟踪模块
-
-#### `move.py`
-
-该文件实现路径跟踪控制逻辑，是规划结果能够真正转化为机器人运动的关键。
-
-主要内容包括：
-
-- 欧氏距离计算 `cal_dist`；
-- 目标方向角计算 `cal_theta`；
-- 朝向误差归一化 `cal_theta_error`；
-- 线速度 PID `PID_vx`；
-- 角速度 PID `PID_vw`；
-- 跟踪控制类 `Move`；
-- 终点调头函数 `turn_arround`。
-
-### 3.6 路径规划模块
-
-#### `prm.py`
-
-实现概率路图 PRM（Probabilistic Roadmap）。步骤是：
-
-1. 根据视觉信息提取障碍物；
-2. 在场地内随机采样可通行点；
-3. 将采样点连接为无碰撞路网；
-4. 在路网上使用 Dijkstra 搜索最短路径。
-
-#### `rrt.py`
-
-实现快速扩展随机树 RRT（Rapidly-exploring Random Tree）。步骤是：
-
-1. 以起点为根开始扩展；
-2. 随机采样目标偏置点；
-3. 找到树中最近节点；
-4. 朝随机点扩展固定步长；
-5. 若新边无碰撞则加入树；
-6. 当新节点接近目标或可直连目标时结束；
-7. 通过父节点索引回溯得到路径。
-
-### 3.7 备用速度实验模块
-
-#### `Track.py`
-
-这个文件实现了一个更简单的速度与角速度生成方法，根据当前位置到目标点的偏差直接计算：
-
-- 线速度 `robot_v`
-- 角速度 `robot_vw`
-
-但它在当前主程序中并未实际参与控制，属于实验性/备用实现。
-
----
-
-## 4. 程序整体执行流程
-
-以下是 `main.py` 中的完整导航逻辑。
-
-### 4.1 初始化阶段
-
-程序启动后创建：
-
-- `Vision()`：负责接收视觉数据；
-- `Action()`：负责发送控制指令；
-- `Debugger()`：负责显示规划结果；
-- `RRT()`：当前实际使用的规划器；
-
-然后设置：
-
-- 目标点 `goal_x, goal_y = -2400, -1500`
-- 往返次数 `loop_count = 5`
-
-### 4.2 获取起点
-
-主循环中会不断检查 `vision.my_robot.x`、`vision.my_robot.y`。如果起点坐标仍然小于一个极小值（如 `< -10000`），说明视觉数据尚未正常更新，程序会继续等待，直到拿到有效位姿。
-
-### 4.3 规划路径
-
-当起点有效后，主程序调用：
-
-```python
-path_x, path_y, road_map, sample_x, sample_y = planner.plan(
-    vision=vision,
-    start_x=start_x,
-    start_y=start_y,
-    goal_x=goal_x,
-    goal_y=goal_y
-)
+控制流程：
+```
+当前位置 + 目标航点 → 误差计算 → PID控制器 → 速度指令
 ```
 
-这里返回的不只是最终路径，还包括：
+### 3.2 辅助函数详解
 
-- `sample_x`, `sample_y`：采样点集合；
-- `road_map`：点之间的连接关系；
-- `path_x`, `path_y`：最终路径点序列。
-
-### 4.4 显示规划结果
-
-规划完成后调用：
+#### 3.2.1 距离计算
 
 ```python
-debugger.draw_all(sample_x, sample_y, road_map, path_x, path_y)
+def cal_dist(x1, y1, x2, y2):
+    """计算两点之间的欧氏距离"""
+    dist = math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+    return dist
 ```
 
-这一步会在调试端显示：
-
-- 白色叉号：采样点；
-- 白色连线：路网连接；
-- 绿色折线：最终路径。
-
-### 4.5 路径跟踪
-
-程序随后进入路径跟踪阶段。做法不是一次跟踪整条曲线，而是“逐点推进”：
-
-- 当机器人距离当前目标路径点小于 200 时，就切换到下一个路径点；
-- 正向时，从路径末端逐步索引到起点；
-- 反向时，再从起点逐步索引回路径末端；
-- 每次循环根据当前位置和目标点重新计算速度。
-
-### 4.6 掉头与往返
-
-机器人抵达一端后：
-
-1. 停车；
-2. 调用 `move.turn_arround(action, vision)` 原地旋转约 `pi` 弧度；
-3. 按同一路径反向运动；
-4. 再掉头；
-5. 重复上述过程，直到完成设定往返次数。
-
----
-
-## 5. 导航与规划是如何实现的
-
-这一部分是本项目最核心的内容。
-
-## 5.1 导航问题建模
-
-代码把导航问题抽象成二维平面中的点机器人避障问题：
-
-- 己方机器人当前位置：起点；
-- 指定目标坐标：终点；
-- 其他可见机器人：障碍物；
-- 场地范围：`x ∈ [-4500, 4500]`，`y ∈ [-3000, 3000]`；
-- 机器人本体半径近似：`robot_size = 200`；
-- 额外避障安全距离：`avoid_dist = 200`。
-
-这意味着实际的障碍物判定半径并不是简单的机器人中心点，而是以 `robot_size + avoid_dist = 400` 为安全边界。也就是说，路径不会允许机器人贴着障碍物中心通过，而是预留了一圈安全缓冲区。
-
-### 5.2 障碍物获取方式
-
-无论 PRM 还是 RRT，都会先从 `vision.py` 中读取场上其他机器人的位置来构建障碍集合：
-
-- 蓝方机器人中，排除 0 号车，仅把 `id > 0` 的可见车辆视为障碍；
-- 黄方机器人中，所有可见车辆都视为障碍；
-- 障碍物坐标被放入 `obstacle_x`、`obstacle_y`；
-- 最后通过 `KDTree` 构造障碍物最近邻查询结构。
-
-这里用 `KDTree` 的意义很大：
-
-- 可以快速查询一个点到最近障碍物的距离；
-- 可以用于采样点合法性检查；
-- 可以用于线段碰撞检测中的离散查询。
-
-因此，整个导航系统的基础不是栅格地图，而是“连续平面 + 障碍点集 + KDTree 最近邻搜索”。
-
----
-
-## 6. PRM 规划器详解
-
-`prm.py` 实现的是经典 PRM，两阶段思想非常明确：
-
-1. 先离线式构图（采样 + 建图）；
-2. 再在线式搜索（Dijkstra）。
-
-虽然这里每次规划都会重新采样，严格说是“单次构图 PRM”，但算法结构上仍然是标准 PRM 流程。
-
-### 6.1 采样阶段 `sampling(...)`
-
-PRM 在场地范围内不断生成随机点：
+#### 3.2.2 目标角度计算
 
 ```python
-tx = random in [minx, maxx]
-ty = random in [miny, maxy]
+def cal_theta(x1, y1, x2, y2):
+    """计算从点(x1,y1)指向点(x2,y2)的方向角"""
+    if x1 >= x2 and y1 >= y2:
+        return math.atan((y1 - y2) / (x1 - x2)) - math.pi
+    if x1 >= x2 and y1 < y2:
+        return math.atan((y1 - y2) / (x1 - x2)) + math.pi
+    if x1 < x2:
+        return math.atan((y1 - y2) / (x1 - x2))
 ```
 
-随后查询该点到最近障碍物的距离：
+角度计算说明：
+- 返回的角度是机器人需要朝向的方向
+- 根据目标点的相对位置分情况处理
+- 确保角度在正确的象限
+
+#### 3.2.3 角度误差归一化
 
 ```python
-distance, index = obstree.query([tx, ty])
+def cal_theta_error(theta1, vision):
+    """计算目标角度与当前朝向的误差，归一化到 [-π, π]"""
+    theta_error = theta1 - vision.my_robot.orientation
+    while theta_error > math.pi:
+        theta_error = theta_error - 2 * math.pi
+    while theta_error < -math.pi:
+        theta_error = theta_error + 2 * math.pi
+    return theta_error
 ```
 
-只有当这个距离满足：
+归一化的必要性：
+- 角度是周期性的，π 和 -π 表示同一方向
+- 直接相减可能导致误差被高估（如 3.14 - (-3.14) = 6.28）
+- 归一化后误差表示"最短旋转角度"
+
+#### 3.2.4 速度映射函数
 
 ```python
-distance >= robot_size + avoid_dist
+def function(x):
+    """速度映射函数：抛物线形式"""
+    if x > 3000:
+        x = 3000
+    return -1/3000 * x * (x - 6000)
 ```
 
-该点才会被接受为可通行采样点。
-
-也就是说，PRM 的采样不是无约束乱采，而是“只保留障碍安全范围之外的自由空间点”。
-
-最后，算法会把起点和终点也加入采样点集。这样做的好处是：
-
-- 起点和终点天然成为图中的节点；
-- 不需要额外做“接入图”的特殊处理；
-- 搜索时可以直接把倒数第二个点看作起点，最后一个点看作终点。
-
-### 6.2 路网构建 `generate_roadmap(...)`
-
-PRM 的第二步是建立采样点之间的连边关系。
-
-代码做法是：
-
-1. 对所有采样点建立一个新的 `KDTree`；
-2. 对每个采样点，查询其余所有采样点的距离排序；
-3. 按距离从近到远尝试连接邻居；
-4. 若连线无碰撞，则加入边集；
-5. 每个点最多保留 `KNN = 10` 条邻边。
-
-这样得到的 `road_map` 本质上是邻接表结构，每个节点对应若干可到达邻居索引。
-
-### 6.3 碰撞检测 `check_obs(...)`
-
-这一函数是规划可行性的关键。它不是只检查连线两端，而是沿着候选边做离散步进检测。
-
-处理流程：
-
-1. 计算边方向角 `angle` 和边长度 `dis`；
-2. 若长度超过 `MAX_EDGE_LEN = 5000`，直接视为不可连接；
-3. 以 `step_size = robot_size + avoid_dist` 为步长沿边前进；
-4. 每一步都查询当前位置到最近障碍物的距离；
-5. 若任意一点距离障碍过近，则判定碰撞；
-6. 最后再检查终点附近是否安全。
-
-这相当于用“路径离散采样”的方式近似连续碰撞检测。虽然不是几何上最严格的方法，但简单高效，非常适合课程实验和仿真验证。
-
-### 6.4 图搜索 `dijkstra_search(...)`
-
-有了路网后，PRM 使用 Dijkstra 搜索起点到终点的最短路径。
-
-实现上使用：
-
-- `openset`：待扩展节点集合；
-- `closeset`：已确定最短路径的节点集合；
-- `Node.cost`：从起点累计到当前点的路径代价；
-- `Node.parent`：用于路径回溯的父节点索引。
-
-每次从 `openset` 中选择当前总代价最小的节点进行扩展，检查其所有邻居并更新代价。当终点被取出时，说明最短路已经找到。
-
-### 6.5 路径回溯
-
-搜索成功后，程序从终点沿着 `parent` 指针反向回溯，逐步生成：
-
-- `path_x`
-- `path_y`
-
-因此得到的路径点顺序是“从目标点回到起点”的逆序路径。这一点和 `main.py` 中的索引方式刚好匹配：正向运行时从 `point_num` 往前减，正好是从起点往目标点走。
-
----
-
-## 7. RRT 规划器详解
-
-`rrt.py` 是当前主程序实际使用的规划器，因此它是本项目导航能力的核心实现。
-
-### 7.1 RRT 的基本思想
-
-RRT 不是先在全空间构图，再搜索最短路；而是从起点出发逐步长出一棵树。由于树会优先向随机采样区域扩展，因此能较快覆盖高维或大范围自由空间。
-
-在本项目中，RRT 的流程是：
-
-1. 起点作为树根加入采样集；
-2. 随机生成一个采样目标 `Q_rand`；
-3. 找到树中距离它最近的已有节点 `Q_nearest`；
-4. 从 `Q_nearest` 朝 `Q_rand` 延伸固定距离，得到 `Q_new`；
-5. 若 `Q_new` 与扩展边无碰撞，则把 `Q_new` 加入树；
-6. 若 `Q_new` 已接近目标点，或者 `Q_new` 到目标点之间可直接连通，则把目标点接入树；
-7. 用父节点索引从目标点回溯到起点，得到路径。
-
-### 7.2 树的初始化
-
-在 `sampling(...)` 中：
-
-- `sample_x`, `sample_y` 初始只包含起点；
-- `parent_index = [-1]` 表示根节点没有父节点；
-- 后续每加入一个新节点，都记录它的父节点在树中的索引。
-
-所以，RRT 中真正代表“树结构”的不是显式边表，而是：
-
-- 节点坐标数组 `sample_x/sample_y`
-- 父节点数组 `parent_index`
-
-### 7.3 目标偏置采样
-
-代码中有一个很重要的设计：
-
-```python
-if random_num < 0.1:
-    Q_rand = goal
-else:
-    Q_rand = random point
+函数特性：
 ```
-
-这说明算法使用了 10% 的目标偏置（goal bias）。
-
-其作用是：
-
-- 大多数时候随机探索，保证空间覆盖能力；
-- 少数时候直接朝目标扩展，提高收敛到终点的速度。
-
-这是一种非常常见且有效的 RRT 改进技巧。
-
-### 7.4 最近节点选择
-
-RRT 每轮都会对当前树节点建立 `KDTree`，查询随机点最近的已有节点：
-
-```python
-distance, index = Nodetree.query([Q_rand_x, Q_rand_y])
-```
-
-`index` 对应的就是最近树节点 `Q_nearest`。
-
-这一步保证扩展总是从当前树中最接近随机目标的位置出发。
-
-### 7.5 固定步长扩展 `extend(...)`
-
-扩展函数不是直接把随机点加入树，而是只沿着方向走固定距离：
-
-```python
-Q_new_x = Q_nearest_x + 1000 * cos(theta)
-Q_new_y = Q_nearest_y + 1000 * sin(theta)
-```
-
-这里固定步长为 1000。
-
-这样做的意义是：
-
-- 避免树一次跨太远导致碰撞概率高；
-- 使树逐渐向空间中“生长”；
-- 让路径节点分布更均匀。
-
-因此，该 RRT 是典型的“固定步长增量式扩展”实现。
-
-### 7.6 无碰撞约束
-
-新节点能否加入树，取决于两个条件：
-
-1. `Q_nearest -> Q_new` 这条边本身不能碰撞；
-2. `Q_new` 点到最近障碍物距离必须不小于安全阈值。
-
-其中第一条由 `check_obs(...)` 保证，第二条通过：
-
-```python
-col_distance >= robot_size + avoid_dist
-```
-
-保证新节点本身不会落在障碍物安全区内。
-
-### 7.7 终止条件
-
-RRT 在以下情况下认为可以结束：
-
-```python
-if not self.check_obs(Q_new_x, Q_new_y, goal_x, goal_y, obstree) or goal_distance < 400:
-```
-
-意思是满足任意一个条件即可：
-
-- 新节点到目标点之间已经可以无碰撞直连；
-- 新节点距离目标点小于 400。
-
-一旦满足条件，程序会把目标点直接加入树，并记录其父节点为最后一个新节点，然后结束采样扩展。
-
-这说明该实现并不追求“严格到达目标点再继续扩展”，而是只要已经具备安全接入目标的条件就停止，从而提高规划效率。
-
-### 7.8 路径提取 `get_path(...)`
-
-RRT 路径不是通过搜索图得到的，而是直接沿父节点数组回溯：
-
-1. 从最后加入的目标点节点开始；
-2. 根据 `parent_index[last_index]` 找到其父节点；
-3. 重复直到根节点 `-1`；
-4. 将回溯得到的点加入 `path_x/path_y`。
-
-最终路径同样是逆序存储：从目标回到起点。
-
-### 7.9 这个 RRT 实现的特点
-
-该实现具有以下特征：
-
-- 使用连续空间采样，而非栅格搜索；
-- 使用目标偏置，提高到达目标效率；
-- 使用固定步长扩展，结构简单；
-- 使用 KDTree 提升最近邻与碰撞查询效率；
-- 没有做路径平滑或重布线，因此不属于 RRT*；
-- 更偏向“快速得到一条可行路径”，而不是“全局最优路径”。
-
-这也解释了为什么它适合作为实时导航中的快速静态规划器。
-
----
-
-## 8. 路径跟踪与运动控制是如何实现的
-
-规划只解决“走哪条路”，而 `move.py` 解决的是“怎么沿这条路走”。
-
-### 8.1 路径点切换策略
-
-主程序把路径看作一串离散航点。机器人每次控制时都朝当前索引对应的路径点前进。
-
-当满足：
-
-```python
-dist_of_next_point < 200
-```
-
-就认为该点已经到达，并切换到下一个目标点。
-
-这是一种非常常见的 waypoint tracking（航点跟踪）方法，简单直接。
-
-### 8.2 位置误差计算
-
-`Move.get_action(...)` 中会计算两个距离：
-
-- 当前点到目标航点的距离 `dist_error1`；
-- 当前点到相邻上一航点/下一航点的距离 `dist_error2`。
-
-随后取：
-
-```python
-dist_error = min(dist_error1, dist_error2)
-```
-
-这样做的目的，是减少机器人恰好越过某个航点或处在两点之间时带来的误差突变，使线速度估计更平滑一些。
-
-### 8.3 朝向误差计算
-
-程序先通过 `cal_theta(...)` 计算机器人当前位置指向目标航点的方向角，再通过 `cal_theta_error(...)` 与机器人当前朝向相减，并把误差规范到 `[-pi, pi]` 范围内。
-
-这一步非常重要，因为旋转控制必须处理角度跨越 `pi/-pi` 的跳变问题，否则会出现明明只需小角度转动，却被误判为需要大角度反向旋转的情况。
-
-### 8.4 线速度控制 `PID_vx(...)`
-
-线速度控制使用一个简化 PID：
-
-- `Kp = 1.5`
-- `Ki = 0.01`
-- `Kd = 0`
-
-但它不是直接输出 PID 结果，而是把结果传入一个非线性函数：
-
-```python
 f(x) = -1/3000 * x * (x - 6000)
+     = -1/3000 * x² + 2x
 ```
 
-并且限制最终速度范围。这个函数在 `x` 处于一定区间时可形成平滑的抛物线型速度映射，避免控制量过小或过大，起到一种“速度整形”的作用。
+这是一个开口向下的抛物线：
+- 当 x = 0 时，f(0) = 0
+- 当 x = 3000 时，f(3000) = 3000（最大值）
+- 当 x = 6000 时，f(6000) = 0
 
-同时，路径中间点和端点使用不同的最小速度阈值：
+作用：
+- 将 PID 输出映射到合理的速度范围
+- 限制最大速度
+- 提供平滑的速度变化曲线
 
-- 中间段最小速度 1000；
-- 端点段最小速度 500。
+### 3.3 PID 控制器详解
 
-这意味着机器人在路径中段更倾向于保持较快运动，在接近起终点时则允许更慢、更稳。
-
-### 8.5 角速度控制 `PID_vw(...)`
-
-角速度控制参数为：
-
-- `Kp = 5`
-- `Ki = 0.015`
-- `Kd = 0.015`
-
-并将输出上限限制到 5。
-
-因此该控制器更强调快速修正朝向误差，确保机器人能够及时对准下一个航点。
-
-### 8.6 控制输出缩放
-
-在 `main.py` 中，真正发送的线速度不是原始 `vx`，而是：
+#### 3.3.1 线速度 PID
 
 ```python
-1.2 * vx / (1 + 2 * abs(vw))
+def PID_vx(vx_error, vx_error_sum, vx_error_last, flag):
+    Kp = 1.5
+    Ki = 0.01
+    Kd = 0
+    
+    # 积分限幅，防止积分饱和
+    if vx_error_sum > 10000:
+        vx_error_sum = 10000
+    
+    output = Kp * vx_error + Ki * vx_error_sum + Kd * vx_error_last
+    
+    # 非线性映射
+    if flag:
+        output = function(output)
+        output = max(output, 1200)  # 中间点最小速度
+    else:
+        output = function(output)
+        output = max(output, 450)   # 终点最小速度
+    
+    # 速度上限
+    if output > 4000:
+        output = 4000
+    
+    return output
 ```
 
-也就是说：
+参数说明：
+- **Kp = 1.5**：比例系数，决定对位置误差的响应强度
+- **Ki = 0.01**：积分系数，消除稳态误差
+- **Kd = 0**：微分系数，本实现中未使用
 
-- 当角速度很小，机器人基本直行，线速度较高；
-- 当角速度变大，机器人正在明显转向，线速度自动下降。
+最小速度策略：
+- 中间航点：最小 1200，确保快速通过
+- 终点航点：最小 450，确保精确定位
 
-这是一种很实用的耦合策略，能够避免“边高速前进边大幅转弯”带来的轨迹震荡或偏离。
-
-### 8.7 掉头控制 `turn_arround(...)`
-
-到达路径端点后，机器人会原地转身。实现方式为：
-
-- 记录初始朝向 `start_theta`；
-- 持续发送角速度命令；
-- 当累计转角接近 `pi - 0.2` 时停止；
-- 前半段转得快，后半段转得稍慢。
-
-这个策略虽然简单，但足以完成“往返巡航”任务中的 180 度掉头需求。
-
----
-
-## 9. 数据流和通信机制
-
-整个系统依赖三个 UDP 通道：
-
-### 9.1 视觉输入
-
-- 地址：`127.0.0.1:23333`
-- 来源：视觉检测模块
-- 内容：机器人和球的检测结果
-- 用途：更新场上状态，供规划和控制使用
-
-### 9.2 控制输出
-
-- 地址：`localhost:50001`
-- 内容：机器人速度指令
-- 用途：驱动 0 号蓝车运动
-
-### 9.3 调试显示
-
-- 地址：`localhost:20001`
-- 内容：点、线、圆、路径等调试图元
-- 用途：显示规划采样点、路网、最终路径
-
-这种设计的优点是模块解耦明显：感知、规划、控制、显示互相独立，只通过网络消息交互。
-
----
-
-## 10. 代码中的关键设计细节
-
-### 10.1 为什么路径数组是“反向”的
-
-无论 PRM 还是 RRT，路径回溯都是从终点开始沿父节点找回起点，因此 `path_x/path_y` 存储顺序天然是：
-
-`目标点 -> ... -> 起点`
-
-主程序正向运行时设置：
+#### 3.3.2 角速度 PID
 
 ```python
-Next_point_index = point_num
+def PID_vw(vw_error, vw_error_sum, vw_error_last):
+    Kp = 5
+    Ki = 0.015
+    Kd = 0.015
+    
+    # 积分限幅
+    if vw_error_sum > 40:
+        vw_error_sum = 40
+    
+    output = Kp * vw_error + Ki * vw_error_sum + Kd * vw_error_last
+    
+    # 角速度上限
+    if output > 5:
+        output = 5
+    
+    return output
 ```
 
-也就是从路径数组最后一个元素开始追踪，而最后一个元素恰好是起点，所以这套索引逻辑是自洽的。
+参数说明：
+- **Kp = 5**：较高的比例系数，快速修正朝向
+- **Ki = 0.015**：消除朝向稳态误差
+- **Kd = 0.015**：抑制角速度震荡
 
-### 10.2 为什么不是栅格地图导航
+### 3.4 Move 类核心方法
 
-代码没有把场地离散成 occupancy grid，而是直接在连续坐标空间中使用：
+#### 3.4.1 状态变量
 
-- 障碍物点集
-- 安全距离
-- KDTree 最近邻查询
-- 采样式规划
+```python
+class Move:
+    def __init__(self):
+        # 位置误差相关
+        self.position_error_last = 0      # 上一次位置误差
+        self.position_error = 0           # 当前位置误差
+        self.position_error_sum = 0       # 位置误差积分
+        
+        # 角度误差相关
+        self.theta_error_last = 0         # 上一次角度误差
+        self.theta_error = 0              # 当前角度误差
+        self.theta_error_sum = 0          # 角度误差积分
+```
 
-这使得实现更轻量，也更适合机器人足球这类场地连续、障碍相对稀疏的任务。
+#### 3.4.2 主控制函数
 
-### 10.3 为什么说它是“静态规划”
+```python
+def get_action(self, vision, path_x, path_y, Next_point_index, direction=1):
+    current_x, current_y = vision.my_robot.x, vision.my_robot.y
+    
+    # 计算到目标航点的距离
+    dist_error1 = cal_dist(current_x, current_y, 
+                           path_x[Next_point_index], path_y[Next_point_index])
+    
+    # 计算到相邻航点的距离（平滑误差）
+    if direction == 1:
+        dist_error2 = cal_dist(current_x, current_y,
+                               path_x[Next_point_index+1], path_y[Next_point_index+1])
+    else:
+        dist_error2 = cal_dist(current_x, current_y,
+                               path_x[Next_point_index-1], path_y[Next_point_index-1])
+    
+    # 取较小值作为误差（处理航点切换瞬间的误差跳变）
+    dist_error = min(dist_error1, dist_error2)
+    
+    # 更新位置误差状态
+    self.position_error_last = self.position_error
+    self.position_error = dist_error
+    self.position_error_sum = self.position_error_sum + self.position_error
+    
+    # 计算目标角度和角度误差
+    theta_error = cal_theta(current_x, current_y,
+                            path_x[Next_point_index], path_y[Next_point_index])
+    
+    # 更新角度误差状态
+    self.theta_error_last = self.theta_error
+    self.theta_error = cal_theta_error(theta_error, vision)
+    self.theta_error_sum = self.theta_error_sum + self.theta_error
+    
+    # 判断是否为终点
+    if Next_point_index == 0 or Next_point_index == len(path_x)-1:
+        flag = False  # 终点，使用较低最小速度
+    else:
+        flag = True   # 中间点，使用较高最小速度
+    
+    # PID 计算输出
+    vx = PID_vx(self.position_error, self.position_error_sum, 
+                self.position_error_last, flag)
+    vw = PID_vw(self.theta_error, self.theta_error_sum, self.theta_error_last)
+    
+    return vx, vw
+```
 
-虽然障碍物来自实时视觉，但当前流程中路径只在开始阶段生成一次，后续往返时不再重新规划，也不会在跟踪过程中因为障碍物变化而触发在线重规划。
+控制逻辑说明：
 
-因此它更准确地说是：
+1. **位置误差计算**：取到当前目标点和相邻点的最小距离，避免航点切换时误差突变
 
-- 基于某一时刻障碍状态的静态路径规划；
-- 再配合实时位置闭环控制进行跟踪。
+2. **角度误差计算**：计算机器人需要朝向的方向与当前朝向的差值
 
-这也是项目名称中“静态规划”的含义所在。
+3. **状态更新**：维护误差的历史值用于 PID 计算
+
+4. **速度输出**：根据位置和角度误差分别计算线速度和角速度
+
+#### 3.4.3 原地旋转函数
+
+```python
+def turn_arround(self, action, vision):
+    """原地旋转约 π 弧度"""
+    start_theta = vision.my_robot.orientation
+    theta_change = 0
+    
+    while theta_change < math.pi - 0.2:
+        if theta_change > 2*math.pi/3:
+            # 后期减速，提高停止精度
+            action.sendCommand(vx=0, vw=2.5)
+        else:
+            # 前期快速旋转
+            action.sendCommand(vx=0, vw=5)
+        time.sleep(0.1)
+        current_theta = vision.my_robot.orientation
+        theta_change = abs(current_theta - start_theta)
+```
+
+旋转策略：
+- **分阶段控制**：前期高速旋转，后期减速
+- **开环控制**：不使用 PID，直接发送固定角速度
+- **停止条件**：累计转角接近 π 弧度
+
+### 3.5 速度耦合策略
+
+在 `main.py` 中，实际发送的线速度进行了耦合调整：
+
+```python
+vx_actual = 1.2 * vx / (1 + 2 * abs(vw))
+```
+
+耦合效果分析：
+
+| 角速度 | 分母 | 线速度比例 |
+|--------|------|-----------|
+| 0 | 1 | 100% |
+| 1 | 3 | 40% |
+| 2 | 5 | 24% |
+| 3 | 7 | 17% |
+| 4 | 9 | 13% |
+| 5 | 11 | 11% |
+
+设计意义：
+- **直行加速**：角速度小时（接近直行），保持较高线速度
+- **转向减速**：角速度大时（大转弯），自动降低线速度
+- **平滑过渡**：使用连续函数，避免速度突变
+- **轨迹稳定**：防止高速转向导致的轨迹震荡
 
 ---
 
-## 11. 当前代码的实际行为总结
+## 4. 整体执行流程
 
-结合全部模块，程序实际完成的任务可以概括为：
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  视觉数据    │────▶│  障碍物提取  │────▶│  RRT* 规划  │
+└─────────────┘     └─────────────┘     └─────────────┘
+                                              │
+                                              ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  速度指令   │◀────│  PID 控制   │◀────│  路径平滑   │
+└─────────────┘     └─────────────┘     └─────────────┘
+```
 
-1. 接收视觉系统给出的场上机器人位姿；
-2. 将其他机器人当作圆形障碍；
-3. 用 RRT（或可替换为 PRM）生成一条从己方 0 号蓝车到目标点的无碰撞路径；
-4. 将路径绘制到调试系统；
-5. 使用 PID 风格控制器沿路径点行驶；
-6. 到达目标后调头并原路返回；
-7. 重复往返若干次后结束。
+详细步骤：
 
-从教学和实验角度看，这个项目已经覆盖了移动机器人导航中的几个核心环节：
-
-- 环境感知接入
-- 障碍物建模
-- 采样式路径规划
-- 路径跟踪控制
-- 运动指令下发
-- 结果可视化
+1. **感知阶段**：接收视觉系统给出的场上机器人位姿
+2. **建模阶段**：将其他机器人作为圆形障碍物（安全膨胀半径 400）
+3. **规划阶段**：使用 RRT* 生成无碰撞最优路径
+4. **后处理阶段**：剪枝优化 + 插值平滑
+5. **控制阶段**：使用 PID 控制器沿路径点行驶
+6. **往返阶段**：到达目标后调头并原路返回
 
 ---
 
-## 12. 运行依赖与使用方式
-
-从源码可推断，运行本项目至少需要：
-
-- Python 3
-- `numpy`
-- `scipy`
-- `protobuf`
-
-并且需要外部系统提供：
-
-- 视觉数据 UDP 输入；
-- 机器人控制指令接收端；
-- 调试显示接收端。
-
-直接运行入口为：
+## 5. 运行方式
 
 ```bash
 python main.py
 ```
 
-如果视觉模块未启动，`vision.py` 会持续打印 `VISION TIMED OUT`。
-
----
-
-## 13. 可以重点学习的导航/规划知识点
-
-如果把这个项目作为课程设计或导航算法学习样例，最值得关注的知识点有：
-
-### 13.1 障碍物安全膨胀
-
-代码没有直接以障碍物中心作为碰撞边界，而是使用：
-
-```python
-robot_size + avoid_dist
-```
-
-这相当于对障碍物进行“膨胀”，是移动机器人路径规划中的典型处理方式。
-
-### 13.2 采样式规划
-
-项目展示了两类经典采样法：
-
-- PRM：先建图，再最短路搜索；
-- RRT：从起点长树，快速找到可行路径。
-
-二者都适用于连续空间，避免了栅格离散带来的维度爆炸和地图构建成本。
-
-### 13.3 KDTree 在导航中的应用
-
-`KDTree` 在这里承担了三类任务：
-
-- 最近障碍查询；
-- 最近采样点查询；
-- 最近树节点查询。
-
-这是提高采样规划效率的关键数据结构。
-
-### 13.4 规划与控制分层
-
-该项目清晰体现了机器人导航中的两层结构：
-
-- 上层规划：决定路径；
-- 下层控制：跟踪路径。
-
-这正是很多真实机器人系统的基础架构。
-
----
-
-## 14. 当前实现的局限性
-
-为了更准确理解代码，也需要看到它的边界：
-
-1. 规划主要基于单次环境快照，没有动态重规划；
-2. 障碍物被简化成点 + 安全半径，没有更精细的形状建模；
-3. 路径跟踪是航点式控制，不含曲线平滑；
-4. RRT 没有做最优性增强，不保证路径最短；
-5. 控制器较经验化，参数需要依赖实验调节；
-6. `Track.py` 存在但未接入主流程。
-
-这些局限并不影响它作为导航规划课程实验代码的完整性，反而说明项目重点放在“跑通规划闭环”而不是工业级鲁棒性上。
-
----
-
-## 15. 总结
-
-这是一个结构清晰、目标明确的机器人导航实验项目。它完成了从实时视觉接入、障碍提取、采样式路径规划，到路径跟踪控制和调试可视化的整套基础流程。
-
-就“导航与规划”而言，本项目最核心的价值在于：
-
-- 用 `vision.py` 将真实/仿真的场上状态转化为可规划的障碍信息；
-- 用 `prm.py` 和 `rrt.py` 在连续空间中寻找无碰撞路径；
-- 用 `move.py` 将离散路径点变成机器人可执行的速度控制；
-- 用 `debug.py` 把规划过程和结果直观展示出来。
-
-如果你要把这份代码用于课程汇报，可以将其概括为：
-
-“一个基于 UDP 通信、融合视觉感知、采样式路径规划和 PID 路径跟踪的二维机器人静态导航系统。”
+运行依赖：
+- Python 3.x
+- `numpy`, `scipy`, `protobuf`
+- 外部视觉系统 (UDP 23333)
+- 机器人控制接收端 (UDP 50001)
+- 调试显示接收端 (UDP 20001)
