@@ -2,7 +2,9 @@
 机器人导航主程序
 
 实现机器人在动态环境中的实时导航、避障与脱困规划。
-采用 RRT* 全局规划 + DWA 局部避障 + Pure Pursuit 路径跟踪的混合架构。
+采用 A* 全局规划 + 改进的 DWA 局部避障 + Pure Pursuit 路径跟踪的混合架构。
+
+往返目标: 在起点与终点之间自动往返 5 次
 """
 
 import time
@@ -35,7 +37,12 @@ class NavigationState(Enum):
     ARRIVED = auto()        # 到达目标
     REPLANNING = auto()     # 重规划中
     EMERGENCY = auto()      # 紧急避障
+    COMPLETED = auto()       # 完成所有往返
 
+
+# =============================================================================
+# 导航状态机
+# =============================================================================
 
 class NavigationStateMachine:
     """
@@ -48,6 +55,8 @@ class NavigationStateMachine:
         self.cfg = cfg or global_config
         self.state = NavigationState.TO_GOAL_A
         self._goal_switch_count = 0
+        self._max_trips = 5
+        self._total_completed_trips = 0
     
     def get_current_goal(self) -> np.ndarray:
         """获取当前目标"""
@@ -62,9 +71,15 @@ class NavigationStateMachine:
         """切换目标"""
         if self.state == NavigationState.TO_GOAL_A:
             self.state = NavigationState.TO_GOAL_B
+            self._goal_switch_count = 1
         elif self.state == NavigationState.TO_GOAL_B:
             self.state = NavigationState.TO_GOAL_A
-        self._goal_switch_count += 1
+            self._goal_switch_count = 2
+            self._total_completed_trips += 1
+            
+            if self._total_completed_trips >= self._max_trips:
+                self.state = NavigationState.COMPLETED
+                print(f"=== 完成所有 {self._max_trips} 次往返任务! ===")
     
     def set_state(self, state: NavigationState):
         """设置状态"""
@@ -78,6 +93,25 @@ class NavigationStateMachine:
     def goal_switch_count(self) -> int:
         """获取目标切换次数"""
         return self._goal_switch_count
+    
+    @property
+    def total_completed_trips(self) -> int:
+        """获取已完成的往返次数"""
+        return self._total_completed_trips
+    
+    @property
+    def max_trips(self) -> int:
+        """获取目标往返次数"""
+        return self._max_trips
+    
+    def get_progress_info(self) -> str:
+        """获取进度信息"""
+        if self.state == NavigationState.COMPLETED:
+            return f"完成! 共 {self._total_completed_trips} 次往返"
+        else:
+            current_trip = self._total_completed_trips + 1
+            direction = "A->B" if self.state == NavigationState.TO_GOAL_B else "B->A"
+            return f"第 {current_trip}/{self._max_trips} 次往返 ({direction})"
 
 
 # =============================================================================
@@ -207,8 +241,7 @@ class NavigationController:
         # -----------------------------------------------------------------
         should_replan = (
             self.path_manager.current_path is None or
-            self.replan_counter >= self.cfg.system.REPLAN_INTERVAL or
-            self.stuck_detector.stuck_count > 50
+            self.replan_counter >= self.cfg.system.REPLAN_INTERVAL
         )
         
         if should_replan and self.state_machine.is_navigating():
@@ -230,12 +263,19 @@ class NavigationController:
         if is_emergency and emergency_cmd:
             vx, vw = emergency_cmd.vx, emergency_cmd.vw
             self.state_machine.set_state(NavigationState.EMERGENCY)
+            self.emergency_counter = 0
         else:
             if self.state_machine.state == NavigationState.EMERGENCY:
-                # 恢复导航
-                self.state_machine.set_state(NavigationState.TO_GOAL_A 
-                                            if np.linalg.norm(goal - self.cfg.goal.GOAL_A) < 1
-                                            else NavigationState.TO_GOAL_B)
+                if not hasattr(self, 'emergency_counter'):
+                    self.emergency_counter = 0
+                self.emergency_counter += 1
+                
+                if self.emergency_counter > 20:
+                    if self.state_machine._goal_switch_count % 2 == 0:
+                        self.state_machine.set_state(NavigationState.TO_GOAL_A)
+                    else:
+                        self.state_machine.set_state(NavigationState.TO_GOAL_B)
+                    self.emergency_counter = 0
             
             # -------------------------------------------------------------
             # 4. 局部规划 + 控制
@@ -267,30 +307,62 @@ class NavigationController:
                     print(f"  -> 直接控制到目标: ({goal[0]:.0f}, {goal[1]:.0f})")
         
         # -----------------------------------------------------------------
-        # 5. 到达检测
+        # 5. 到达检测 (需要连续多帧检测通过)
         # -----------------------------------------------------------------
         distance_to_goal = euclidean_distance(robot_pos, goal)
         
+        if not hasattr(self, 'arrival_counter'):
+            self.arrival_counter = 0
+        
         if distance_to_goal < self.cfg.goal.ARRIVAL_THRESHOLD:
-            print(f"[帧 {self.frame_count}] 到达目标! 切换中...")
+            self.arrival_counter += 1
+        else:
+            self.arrival_counter = 0
+        
+        if self.arrival_counter >= 10:
+            if self.state_machine.state == NavigationState.COMPLETED:
+                print(f"[帧 {self.frame_count}] 所有任务已完成，停止!")
+                self.action.sendCommand(vx=0, vw=0)
+                time.sleep(1.0)
+                return
+            
+            print(f"[帧 {self.frame_count}] 到达目标! {self.state_machine.get_progress_info()}")
             self.state_machine.switch_goal()
+            
+            if self.state_machine.state == NavigationState.COMPLETED:
+                print(f"=== 完成所有 {self.state_machine.max_trips} 次往返任务! ===")
+                self.path_manager.current_path = None
+                self.motion_controller.reset()
+                self.stuck_detector.reset()
+                vx, vw = 0, 0
+                self.action.sendCommand(vx=vx, vw=vw)
+                return
+            
             self.path_manager.current_path = None
             self.motion_controller.reset()
             self.stuck_detector.reset()
             
-            # 原地旋转一下
             vx, vw = self.motion_controller.rotation_command()
             self.action.sendCommand(vx=vx, vw=vw)
             time.sleep(0.3)
             return
         
         # -----------------------------------------------------------------
-        # 6. 卡住检测
+        # 6. 接近目标时简化控制
         # -----------------------------------------------------------------
-        if self.stuck_detector.update(robot_pos):
-            print(f"[帧 {self.frame_count}] 检测到卡住，触发重规划")
-            self.path_manager.current_path = None
-            self.stuck_detector.reset()
+        approaching_goal = distance_to_goal < 500
+        
+        # -----------------------------------------------------------------
+        # 7. 卡住检测 (接近目标时跳过卡住检测)
+        # -----------------------------------------------------------------
+        if not approaching_goal and self.stuck_detector.update(robot_pos):
+            current_goal = self.state_machine.get_current_goal()
+            dist_to_current_goal = euclidean_distance(robot_pos, current_goal)
+            
+            if dist_to_current_goal > 300:
+                print(f"[帧 {self.frame_count}] 检测到卡住，触发重规划")
+                self.path_manager.current_path = None
+                self.stuck_detector.reset()
         
         # -----------------------------------------------------------------
         # 7. 执行命令
@@ -299,10 +371,12 @@ class NavigationController:
         
         # 调试输出
         if self.frame_count % 10 == 0:
+            progress = self.state_machine.get_progress_info()
             print(f"[帧 {self.frame_count}] 位置: ({robot.x:.0f}, {robot.y:.0f}), "
                   f"朝向: {math.degrees(robot_heading):.1f}°, "
                   f"速度: vx={vx:.0f}, vw={vw:.2f}, "
-                  f"到目标距离: {distance_to_goal:.0f}")
+                  f"到目标距离: {distance_to_goal:.0f}, "
+                  f"进度: {progress}")
         
         # -----------------------------------------------------------------
         # 8. 调试可视化
@@ -314,11 +388,17 @@ class NavigationController:
         if path.is_empty:
             return Point(0, 0)
         
-        # 取路径上较远的点作为目标
         robot = self.vision.my_robot
         robot_pos = np.array([robot.x, robot.y])
+        goal = self.state_machine.get_current_goal()
+        dist_to_goal = euclidean_distance(robot_pos, goal)
         
-        lookahead = min(800, self.motion_controller.current_vx * 0.3 + 300)
+        # 接近目标时，直接以目标点为跟踪点
+        if dist_to_goal < 600:
+            return Point(goal[0], goal[1])
+        
+        # 正常前视距离
+        lookahead = min(600, self.motion_controller.current_vx * 0.2 + 200)
         
         for point in path:
             if euclidean_distance(robot_pos, point.to_array()) >= lookahead:
@@ -342,17 +422,26 @@ class NavigationController:
         """发送调试信息"""
         package = Debug_Msgs()
         
-        # 绘制机器人位置
+        # 绘制机器人位置 (蓝色)
         self.debugger.draw_circle(package, robot_pos[0], robot_pos[1])
         
-        # 绘制目标点
-        self.debugger.draw_circle(package, goal[0], goal[1])
+        # 绘制两个目标点
+        self.debugger.draw_circle(package, self.cfg.goal.GOAL_A[0], self.cfg.goal.GOAL_A[1], radius=200)
+        self.debugger.draw_circle(package, self.cfg.goal.GOAL_B[0], self.cfg.goal.GOAL_B[1], radius=200)
         
-        # 绘制路径
+        # 绘制当前目标 (黄色高亮)
+        self.debugger.draw_circle(package, goal[0], goal[1], radius=250)
+        
+        # 绘制路径 (绿色)
         if self.path_manager.current_path:
             path_x, path_y = self.path_manager.get_path_arrays()
             if path_x and path_y:
                 self.debugger.draw_finalpath(package, path_x, path_y)
+        
+        # 绘制障碍物 (红色)
+        for obs in obstacles:
+            self.debugger.draw_circle(package, obs.center.x, obs.center.y, 
+                                    radius=obs.radius)
         
         # 发送
         self.debugger.send(package)

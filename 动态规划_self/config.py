@@ -36,13 +36,25 @@ class FieldConfig:
 @dataclass
 class RobotConfig:
     """机器人参数配置"""
-    RADIUS: float = 200.0           # 机器人半径 (mm)
-    MAX_VX: float = 3000.0          # 最大线速度 (mm/s)
-    MAX_VY: float = 1000.0          # 最大侧向速度 (mm/s)
-    MAX_VW: float = 12.0            # 最大角速度 (rad/s)
-    MAX_AX: float = 3000.0          # 最大线加速度 (mm/s²)
+    RADIUS: float = 150.0           # 机器人半径 (mm)
+    MAX_VX: float = 2500.0          # 最大线速度 (mm/s)
+    MAX_VY: float = 0.0             # 最大侧向速度 (mm/s)
+    MAX_VW: float = 15.0            # 最大角速度 (rad/s)
+    MAX_AX: float = 2500.0          # 最大线加速度 (mm/s²)
     MAX_AW: float = 20.0            # 最大角加速度 (rad/s²)
-    SAFE_DISTANCE: float = 300.0    # 安全距离余量 (mm)
+    SAFE_DISTANCE: float = 80.0     # 安全距离余量 (mm) - 调小让小车更勇敢
+
+
+# =============================================================================
+# A* 参数
+# =============================================================================
+
+@dataclass
+class AStarConfig:
+    """A* 规划器参数配置"""
+    GOAL_THRESHOLD: float = 400.0      # 目标到达阈值 (mm)
+    GRID_RESOLUTION: float = 200.0     # 网格分辨率 (mm)
+    SMOOTH_ITERATIONS: int = 30        # 路径平滑迭代次数
 
 
 # =============================================================================
@@ -80,7 +92,7 @@ class DWAConfig:
     PATH_WEIGHT: float = 0.2            # 路径跟随权重
     
     # 安全参数
-    OBSTACLE_THRESHOLD: float = 600.0   # 障碍物影响距离 (mm)
+    OBSTACLE_THRESHOLD: float = 200.0   # 障碍物影响距离 (mm)
     MIN_OBSTACLE_DIST: float = 100.0    # 最小安全距离 (mm)
 
 
@@ -120,7 +132,7 @@ class GoalConfig:
     """目标点配置"""
     GOAL_A: np.ndarray = None
     GOAL_B: np.ndarray = None
-    ARRIVAL_THRESHOLD: float = 150.0    # 到达阈值 (mm)
+    ARRIVAL_THRESHOLD: float = 200.0    # 到达阈值 (mm)
     
     def __post_init__(self):
         self.GOAL_A = np.array([-2400.0, -1500.0])
@@ -134,11 +146,11 @@ class GoalConfig:
 @dataclass
 class SystemConfig:
     """系统运行参数配置"""
-    CONTROL_FREQUENCY: float = 100.0    # 控制频率 (Hz)
-    REPLAN_INTERVAL: int = 30           # 重规划间隔 (帧)
-    STUCK_THRESHOLD: float = 20.0       # 卡住检测阈值 (mm)
-    STUCK_FRAMES: int = 100             # 卡住检测帧数
-    STARTUP_DELAY: float = 0.5          # 启动延迟 (s)
+    CONTROL_FREQUENCY: float = 50.0    # 控制频率 (Hz)
+    REPLAN_INTERVAL: int = 50           # 重规划间隔 (帧)
+    STUCK_THRESHOLD: float = 30.0       # 卡住检测阈值 (mm)
+    STUCK_FRAMES: int = 150            # 卡住检测帧数
+    STARTUP_DELAY: float =0.5          # 启动延迟 (s)
 
 
 # =============================================================================
@@ -162,6 +174,7 @@ class Config:
         
         self.field = FieldConfig()
         self.robot = RobotConfig()
+        self.astar = AStarConfig()
         self.rrt = RRTConfig()
         self.dwa = DWAConfig()
         self.pure_pursuit = PurePursuitConfig()

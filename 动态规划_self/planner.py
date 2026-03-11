@@ -2,7 +2,7 @@
 全局路径规划模块
 
 包含:
-- RRTStarPlanner: RRT* 渐进最优路径规划器
+- AStarPlanner: A* 全局路径规划器
 - PathSmoother: 路径平滑器
 """
 
@@ -11,9 +11,216 @@ import random
 import numpy as np
 from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
+import heapq
 
 from config import Config, config as global_config
 from utils import Point, Circle, Path, euclidean_distance, circle_segment_collision
+
+
+# =============================================================================
+# A* 节点
+# =============================================================================
+
+@dataclass
+class AStarNode:
+    """A* 树节点"""
+    x: float
+    y: float
+    g_cost: float = 0.0              # 从起点到该节点的代价
+    h_cost: float = 0.0              # 从该节点到目标的启发式代价
+    parent: Optional['AStarNode'] = None
+    
+    @property
+    def f_cost(self) -> float:
+        return self.g_cost + self.h_cost
+    
+    @property
+    def point(self) -> Point:
+        return Point(self.x, self.y)
+    
+    @property
+    def position(self) -> np.ndarray:
+        return np.array([self.x, self.y])
+    
+    def __lt__(self, other: 'AStarNode') -> bool:
+        return self.f_cost < other.f_cost
+    
+    def __eq__(self, other: 'AStarNode') -> bool:
+        if isinstance(other, AStarNode):
+            return abs(self.x - other.x) < 1e-3 and abs(self.y - other.y) < 1e-3
+        return False
+    
+    def __hash__(self) -> int:
+        return hash((round(self.x, 1), round(self.y, 1)))
+    
+    def distance_to(self, other: 'AStarNode') -> float:
+        return math.hypot(self.x - other.x, self.y - other.y)
+    
+    def distance_to_point(self, point: Point) -> float:
+        return math.hypot(self.x - point.x, self.y - point.y)
+
+
+# =============================================================================
+# A* 规划器
+# =============================================================================
+
+class AStarPlanner:
+    """
+    A* 全局路径规划器
+    
+    特点:
+    - 启发式搜索，效率高
+    - 可保证最优路径
+    - 适合静态环境
+    """
+    
+    def __init__(self, cfg: Config = None):
+        self.cfg = cfg or global_config
+        self.last_path: Optional[Path] = None
+        self.grid_resolution = 150.0
+        self.visited_cells = set()
+    
+    def plan(self, start: np.ndarray, goal: np.ndarray, 
+             obstacles: List[Circle]) -> Optional[Path]:
+        """
+        规划从起点到终点的路径
+        
+        Args:
+            start: 起点坐标 [x, y]
+            goal: 终点坐标 [x, y]
+            obstacles: 障碍物列表
+            
+        Returns:
+            Path 对象，规划失败返回 None
+        """
+        start_node = AStarNode(x=start[0], y=start[1])
+        goal_node = AStarNode(x=goal[0], y=goal[1])
+        
+        open_set = []
+        closed_set = set()
+        heapq.heappush(open_set, start_node)
+        
+        came_from = {}
+        g_score = {start_node: 0.0}
+        
+        iterations = 0
+        max_iterations = 5000
+        
+        while open_set and iterations < max_iterations:
+            iterations += 1
+            current = heapq.heappop(open_set)
+            
+            if current.distance_to(goal_node) <= self.cfg.astar.GOAL_THRESHOLD:
+                path = self._reconstruct_path(current, came_from)
+                self.last_path = self._smooth_path(path, obstacles)
+                return self.last_path
+            
+            closed_set.add(current)
+            
+            neighbors = self._get_neighbors(current)
+            
+            for neighbor in neighbors:
+                if neighbor in closed_set:
+                    continue
+                
+                if self._check_collision_node(neighbor, obstacles):
+                    continue
+                
+                tentative_g = current.g_cost + current.distance_to(neighbor)
+                
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    neighbor.g_cost = tentative_g
+                    neighbor.h_cost = neighbor.distance_to(goal_node)
+                    
+                    if neighbor not in open_set:
+                        heapq.heappush(open_set, neighbor)
+        
+        return None
+    
+    def _get_neighbors(self, node: AStarNode) -> List[AStarNode]:
+        """获取邻居节点"""
+        neighbors = []
+        resolution = self.grid_resolution
+        
+        directions = [
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1)
+        ]
+        
+        for dx, dy in directions:
+            new_x = node.x + dx * resolution
+            new_y = node.y + dy * resolution
+            
+            if self._is_in_field(new_x, new_y):
+                neighbor = AStarNode(x=new_x, y=new_y)
+                neighbors.append(neighbor)
+        
+        return neighbors
+    
+    def _is_in_field(self, x: float, y: float) -> bool:
+        """检查点是否在场地内"""
+        margin = 100
+        return (self.cfg.field.MIN_X + margin < x < self.cfg.field.MAX_X - margin and
+                self.cfg.field.MIN_Y + margin < y < self.cfg.field.MAX_Y - margin)
+    
+    def _check_collision_node(self, node: AStarNode, obstacles: List[Circle]) -> bool:
+        """检查节点是否与障碍物碰撞"""
+        node_pos = node.position
+        for obs in obstacles:
+            dist = euclidean_distance(node_pos, [obs.center.x, obs.center.y])
+            if dist < obs.radius + self.grid_resolution * 0.5:
+                return True
+        return False
+    
+    def _check_collision(self, p1: np.ndarray, p2: np.ndarray,
+                         obstacles: List[Circle]) -> bool:
+        """检查两点连线和障碍物是否碰撞"""
+        for obs in obstacles:
+            if circle_segment_collision(
+                np.array([obs.center.x, obs.center.y]),
+                obs.radius,
+                p1, p2
+            ):
+                return True
+        return False
+    
+    def _reconstruct_path(self, current: AStarNode, 
+                         came_from: dict) -> Path:
+        """重建路径"""
+        points = []
+        node = current
+        
+        while node in came_from:
+            points.append(Point(node.x, node.y))
+            node = came_from[node]
+        
+        points.append(Point(node.x, node.y))
+        points.reverse()
+        return Path(points=points)
+    
+    def _smooth_path(self, path: Path, obstacles: List[Circle]) -> Path:
+        """路径平滑 - 使用随机优化"""
+        if len(path.points) <= 2:
+            return path
+        
+        smoothed_points = list(path.points)
+        
+        for _ in range(self.cfg.astar.SMOOTH_ITERATIONS):
+            if len(smoothed_points) <= 2:
+                break
+            
+            i = random.randint(0, len(smoothed_points) - 2)
+            j = random.randint(i + 1, len(smoothed_points) - 1)
+            
+            p1 = smoothed_points[i].to_array()
+            p2 = smoothed_points[j].to_array()
+            
+            if not self._check_collision(p1, p2, obstacles):
+                smoothed_points = smoothed_points[:i+1] + smoothed_points[j:]
+        
+        return Path(points=smoothed_points)
 
 
 # =============================================================================
@@ -330,7 +537,7 @@ class PathManager:
     
     def __init__(self, cfg: Config = None):
         self.cfg = cfg or global_config
-        self.planner = RRTStarPlanner(self.cfg)
+        self.planner = AStarPlanner(self.cfg)
         self.current_path: Optional[Path] = None
         self.current_waypoint_index: int = 0
     

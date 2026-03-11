@@ -106,18 +106,23 @@ class VelocityWindow:
 
 class DWAPlanner:
     """
-    DWA 动态窗口法局部规划器
+    改进的局部路径跟踪器
     
-    在速度空间中搜索最优速度命令，实现实时避障
+    使用Pure Pursuit + PID控制实现稳定的路径跟踪
     """
     
     def __init__(self, cfg: Config = None):
         self.cfg = cfg or global_config
         self.velocity_window = VelocityWindow(cfg)
         
-        # 缓存上一时刻速度（用于加速度限制）
         self.last_vx = 0.0
         self.last_vw = 0.0
+        self.obstacle_history = []
+        self.max_history = 10
+        
+        self.kp_angle = 4.0
+        self.kd_angle = 0.3
+        self.last_heading_error = 0.0
     
     def compute_velocity(self,
                          robot_state: RobotState,
@@ -125,7 +130,7 @@ class DWAPlanner:
                          path: Path,
                          obstacles: List[Circle]) -> VelocityCommand:
         """
-        计算最优速度命令
+        计算速度命令 - 简化和稳定的Pure Pursuit版本
         
         Args:
             robot_state: 机器人当前状态
@@ -136,91 +141,176 @@ class DWAPlanner:
         Returns:
             最优速度命令
         """
-        # 计算动态窗口
-        v_min, v_max, w_min, w_max = self.velocity_window.compute(
-            self.last_vx, self.last_vw
-        )
+        self._update_obstacle_history(obstacles)
         
-        # 计算目标朝向
         dx = target_point.x - robot_state.x
         dy = target_point.y - robot_state.y
         dist_to_target = math.hypot(dx, dy)
         target_heading = math.atan2(dy, dx)
         
-        # 计算朝向误差
         heading_error = angle_difference(target_heading, robot_state.heading)
         
-        # 基础控制：先转向，再前进
-        # 角速度：根据朝向误差直接计算
-        # heading_error = target_heading - current_heading (归一化后)
-        # 当 heading_error > 0 时，目标在左边，需要向左转（正角速度）
-        # 当 heading_error < 0 时，目标在右边，需要向右转（负角速度）
-        base_vw = 4.0 * heading_error
-        base_vw = np.clip(base_vw, w_min, w_max)
+        dt = 0.01
+        d_error = (heading_error - self.last_heading_error) / dt
+        self.last_heading_error = heading_error
         
-        # 线速度：根据朝向误差决定
+        vw = self.kp_angle * heading_error + self.kd_angle * d_error
+        vw = np.clip(vw, -self.cfg.robot.MAX_VW, self.cfg.robot.MAX_VW)
+        
         abs_error = abs(heading_error)
         
-        if abs_error > math.pi * 2 / 3:  # > 120度，停止前进，原地转
-            base_vx = 0
-        elif abs_error > math.pi / 2:  # > 90度，几乎停止
-            base_vx = 50
-        elif abs_error > math.pi / 3:  # > 60度，慢速
-            base_vx = min(500, v_max * 0.3)
-        elif abs_error > math.pi / 6:  # > 30度，中速
-            base_vx = min(1000, v_max * 0.5)
-        else:  # < 30度，全速
-            base_vx = v_max
+        if dist_to_target < 200:
+            vx = 200 * (dist_to_target / 200)
+        elif abs_error > math.pi / 2:
+            vx = 50
+        elif abs_error > math.pi / 3:
+            vx = 300
+        elif abs_error > math.pi / 6:
+            vx = 800
+        else:
+            vx = 1500
         
-        # 障碍物避让调整
-        vx, vw = self._adjust_for_obstacles(
-            robot_state, base_vx, base_vw, obstacles, target_heading
+        avoid_vx, avoid_vw = self._check_obstacle_avoidance(
+            robot_state, obstacles, vx, vw
         )
         
-        # 更新缓存
+        vx = avoid_vx
+        vw = avoid_vw
+        
         self.last_vx = vx
         self.last_vw = vw
         
         return VelocityCommand(vx=vx, vw=vw)
     
-    def _adjust_for_obstacles(self,
-                               robot_state: RobotState,
-                               base_vx: float,
-                               base_vw: float,
-                               obstacles: List[Circle],
-                               target_heading: float) -> Tuple[float, float]:
-        """根据障碍物调整速度"""
+    def _check_obstacle_avoidance(self,
+                                  robot_state: RobotState,
+                                  obstacles: List[Circle],
+                                  base_vx: float,
+                                  base_vw: float) -> Tuple[float, float]:
+        """检查障碍物并调整速度"""
         vx, vw = base_vx, base_vw
         
-        # 检查前方障碍物
+        closest_obs = None
+        closest_dist = float('inf')
+        
         for obs in obstacles:
             dx = obs.center.x - robot_state.x
             dy = obs.center.y - robot_state.y
             dist = math.hypot(dx, dy)
             
-            # 障碍物相对于机器人的角度
-            angle_to_obs = math.atan2(dy, dx)
-            
-            # 障碍物相对于机器人朝向的角度差
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_obs = obs
+        
+        if closest_obs and closest_dist < closest_obs.radius + 300:
+            angle_to_obs = math.atan2(
+                closest_obs.center.y - robot_state.y,
+                closest_obs.center.x - robot_state.x
+            )
             angle_diff = angle_difference(angle_to_obs, robot_state.heading)
             
-            # 前方障碍物检测 (前方60度扇形区域)
-            if abs(angle_diff) < math.pi / 3:
-                safe_dist = obs.radius + 200  # 额外安全距离
+            if abs(angle_diff) < math.pi / 2:
+                safe_dist = closest_obs.radius + 150
                 
-                if dist < safe_dist * 2:
-                    # 接近障碍物，减速
-                    slowdown = max(0.2, (dist - safe_dist) / safe_dist)
-                    vx = base_vx * slowdown
-                    
-                    if dist < safe_dist * 1.2:
-                        # 太近了，需要转向避让
-                        # 选择远离障碍物的方向
-                        # 如果障碍物在左边，向右转；如果在右边，向左转
-                        avoid_direction = -np.sign(angle_diff)
-                        vw += avoid_direction * 4.0
+                if closest_dist < safe_dist:
+                    vx = 150
+                    avoid_dir = -np.sign(angle_diff)
+                    vw = avoid_dir * 4.0
+                else:
+                    slowdown = (closest_dist - safe_dist) / 300
+                    vx = base_vx * max(0.5, slowdown)
         
         return vx, vw
+    
+    def _update_obstacle_history(self, obstacles: List[Circle]):
+        """更新障碍物历史"""
+        self.obstacle_history.append([(obs.center.x, obs.center.y) for obs in obstacles])
+        if len(self.obstacle_history) > self.max_history:
+            self.obstacle_history.pop(0)
+    
+    def _predict_obstacle_position(self, obs_center: np.ndarray, dt: float) -> np.ndarray:
+        """预测障碍物未来位置"""
+        if len(self.obstacle_history) < 2:
+            return obs_center
+        
+        prev_centers = [h for h in self.obstacle_history[-2] 
+                       if np.linalg.norm(np.array(h) - obs_center) < 500]
+        
+        if not prev_centers:
+            return obs_center
+        
+        velocity = obs_center - np.array(prev_centers[0])
+        return obs_center + velocity * dt
+    
+    def _search_best_velocity(self,
+                              robot_state: RobotState,
+                              target_point: Point,
+                              path: Path,
+                              obstacles: List[Circle],
+                              v_min: float, v_max: float,
+                              w_min: float, w_max: float,
+                              base_vx: float, base_vw: float) -> VelocityCommand:
+        """在速度空间中搜索最优速度"""
+        
+        v_samples = self.cfg.dwa.V_SAMPLES
+        w_samples = self.cfg.dwa.W_SAMPLES
+        
+        best_score = float('-inf')
+        best_vx, best_vw = base_vx, base_vw
+        
+        v_range = v_max - v_min
+        w_range = w_max - w_min
+        
+        for i in range(v_samples):
+            for j in range(w_samples):
+                if v_range > 0:
+                    v = v_min + (i + 1) * v_range / (v_samples + 1)
+                else:
+                    v = v_max
+                
+                if w_range > 0:
+                    w = w_min + (j + 1) * w_range / (w_samples + 1)
+                else:
+                    w = 0
+                
+                trajectory = self._predict_trajectory(
+                    robot_state, v, w,
+                    self.cfg.dwa.PREDICT_TIME,
+                    self.cfg.dwa.PREDICT_STEP
+                )
+                
+                if not self._is_trajectory_safe(trajectory, obstacles):
+                    continue
+                
+                score = self._evaluate_trajectory(
+                    trajectory, robot_state, target_point, path, obstacles
+                )
+                
+                if score > best_score:
+                    best_score = score
+                    best_vx, best_vw = v, w
+        
+        if best_score == float('-inf'):
+            return self._emergency_stop(robot_state, obstacles)
+        
+        return VelocityCommand(vx=best_vx, vw=best_vw)
+    
+    def _emergency_stop(self, robot_state: RobotState, 
+                        obstacles: List[Circle]) -> VelocityCommand:
+        """紧急停止"""
+        for obs in obstacles:
+            dx = obs.center.x - robot_state.x
+            dy = obs.center.y - robot_state.y
+            dist = math.hypot(dx, dy)
+            
+            if dist < obs.radius + 300:
+                angle_to_obs = math.atan2(dy, dx)
+                angle_diff = angle_difference(angle_to_obs, robot_state.heading)
+                
+                if abs(angle_diff) < math.pi / 2:
+                    return VelocityCommand(vx=0, vw=np.sign(angle_diff) * 8.0)
+        
+        return VelocityCommand(vx=100, vw=0)
     
     def compute_velocity_simple(self,
                                 robot_state: RobotState,
