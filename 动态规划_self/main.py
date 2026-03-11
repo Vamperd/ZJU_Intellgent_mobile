@@ -1,114 +1,372 @@
 """
 机器人导航主程序
+
 实现机器人在动态环境中的实时导航、避障与脱困规划。
-采用 APF 人工势场法进行局部导航，PRM 概率路网进行脱困规划。
+采用 RRT* 全局规划 + DWA 局部避障 + Pure Pursuit 路径跟踪的混合架构。
 """
+
 import time
+import math
 import numpy as np
+from enum import Enum, auto
 
 from vision import Vision
 from action import Action
 from debug import Debugger
-from plan import Navigator, vector_to_angle, normalize_angle
-from move import MotionController, PositionTracker
 from zss_debug_pb2 import Debug_Msgs
+
+from config import Config, config as global_config
+from utils import (Point, Circle, Path, extract_obstacles, 
+                   euclidean_distance, angle_difference)
+from planner import PathManager
+from local import DWAPlanner, RobotState, EmergencyAvoidance
+from controller import MotionController
+
+
+# =============================================================================
+# 状态机定义
+# =============================================================================
+
+class NavigationState(Enum):
+    """导航状态"""
+    IDLE = auto()           # 空闲状态
+    TO_GOAL_A = auto()      # 前往目标A
+    TO_GOAL_B = auto()      # 前往目标B
+    ARRIVED = auto()        # 到达目标
+    REPLANNING = auto()     # 重规划中
+    EMERGENCY = auto()      # 紧急避障
+
+
+class NavigationStateMachine:
+    """
+    导航状态机
+    
+    管理机器人的导航状态切换
+    """
+    
+    def __init__(self, cfg: Config = None):
+        self.cfg = cfg or global_config
+        self.state = NavigationState.TO_GOAL_A
+        self._goal_switch_count = 0
+    
+    def get_current_goal(self) -> np.ndarray:
+        """获取当前目标"""
+        if self.state == NavigationState.TO_GOAL_A:
+            return self.cfg.goal.GOAL_A
+        elif self.state == NavigationState.TO_GOAL_B:
+            return self.cfg.goal.GOAL_B
+        else:
+            return self.cfg.goal.GOAL_A
+    
+    def switch_goal(self):
+        """切换目标"""
+        if self.state == NavigationState.TO_GOAL_A:
+            self.state = NavigationState.TO_GOAL_B
+        elif self.state == NavigationState.TO_GOAL_B:
+            self.state = NavigationState.TO_GOAL_A
+        self._goal_switch_count += 1
+    
+    def set_state(self, state: NavigationState):
+        """设置状态"""
+        self.state = state
+    
+    def is_navigating(self) -> bool:
+        """是否正在导航"""
+        return self.state in [NavigationState.TO_GOAL_A, NavigationState.TO_GOAL_B]
+    
+    @property
+    def goal_switch_count(self) -> int:
+        """获取目标切换次数"""
+        return self._goal_switch_count
+
+
+# =============================================================================
+# 卡住检测器
+# =============================================================================
+
+class StuckDetector:
+    """
+    卡住检测器
+    
+    检测机器人是否卡住
+    """
+    
+    def __init__(self, cfg: Config = None):
+        self.cfg = cfg or global_config
+        self.reference_pos = None
+        self.stuck_count = 0
+    
+    def update(self, current_pos: np.ndarray) -> bool:
+        """
+        更新检测状态
+        
+        Args:
+            current_pos: 当前位置
+            
+        Returns:
+            是否卡住
+        """
+        if self.reference_pos is None:
+            self.reference_pos = current_pos.copy()
+            return False
+        
+        # 计算移动距离
+        distance = euclidean_distance(current_pos, self.reference_pos)
+        
+        if distance < self.cfg.system.STUCK_THRESHOLD:
+            self.stuck_count += 1
+        else:
+            # 移动了，重置
+            self.stuck_count = 0
+            self.reference_pos = current_pos.copy()
+        
+        return self.stuck_count > self.cfg.system.STUCK_FRAMES
+    
+    def reset(self):
+        """重置检测器"""
+        self.reference_pos = None
+        self.stuck_count = 0
+
+
+# =============================================================================
+# 主控制器
+# =============================================================================
+
+class NavigationController:
+    """
+    导航控制器
+    
+    整合所有模块，实现完整的导航功能
+    """
+    
+    def __init__(self, cfg: Config = None):
+        self.cfg = cfg or global_config
+        
+        # 感知与执行
+        self.vision = Vision()
+        self.action = Action()
+        self.debugger = Debugger()
+        
+        # 导航模块
+        self.state_machine = NavigationStateMachine(cfg)
+        self.path_manager = PathManager(cfg)
+        self.dwa_planner = DWAPlanner(cfg)
+        self.motion_controller = MotionController(cfg)
+        self.emergency_avoidance = EmergencyAvoidance(cfg)
+        
+        # 状态检测
+        self.stuck_detector = StuckDetector(cfg)
+        
+        # 计数器
+        self.frame_count = 0
+        self.replan_counter = 0
+    
+    def run(self):
+        """主循环"""
+        print("导航系统启动...")
+        time.sleep(self.cfg.system.STARTUP_DELAY)
+        
+        while True:
+            try:
+                self._update()
+            except Exception as e:
+                print(f"错误: {e}")
+                self.action.sendCommand(vx=0, vw=0)
+                time.sleep(0.1)
+            
+            # 控制频率
+            time.sleep(1.0 / self.cfg.system.CONTROL_FREQUENCY)
+            self.frame_count += 1
+    
+    def _update(self):
+        """单帧更新"""
+        # -----------------------------------------------------------------
+        # 1. 获取状态
+        # -----------------------------------------------------------------
+        robot = self.vision.my_robot
+        robot_pos = np.array([robot.x, robot.y])
+        robot_heading = robot.orientation
+        
+        # 构建机器人状态
+        robot_state = RobotState(
+            x=robot.x,
+            y=robot.y,
+            heading=robot_heading,
+            vx=self.motion_controller.current_vx,
+            vw=self.motion_controller.current_vw
+        )
+        
+        # 提取障碍物
+        obstacles = extract_obstacles(self.vision, include_teammates=True)
+        
+        # 获取当前目标
+        goal = self.state_machine.get_current_goal()
+        
+        # -----------------------------------------------------------------
+        # 2. 全局规划
+        # -----------------------------------------------------------------
+        should_replan = (
+            self.path_manager.current_path is None or
+            self.replan_counter >= self.cfg.system.REPLAN_INTERVAL or
+            self.stuck_detector.stuck_count > 50
+        )
+        
+        if should_replan and self.state_machine.is_navigating():
+            success = self.path_manager.plan_new_path(robot_pos, goal, obstacles)
+            if success:
+                self.replan_counter = 0
+                self.stuck_detector.reset()
+                print(f"[帧 {self.frame_count}] 规划新路径，长度: {len(self.path_manager.current_path)}")
+        
+        self.replan_counter += 1
+        
+        # -----------------------------------------------------------------
+        # 3. 紧急避障检查
+        # -----------------------------------------------------------------
+        is_emergency, emergency_cmd = self.emergency_avoidance.check_emergency(
+            robot_state, obstacles
+        )
+        
+        if is_emergency and emergency_cmd:
+            vx, vw = emergency_cmd.vx, emergency_cmd.vw
+            self.state_machine.set_state(NavigationState.EMERGENCY)
+        else:
+            if self.state_machine.state == NavigationState.EMERGENCY:
+                # 恢复导航
+                self.state_machine.set_state(NavigationState.TO_GOAL_A 
+                                            if np.linalg.norm(goal - self.cfg.goal.GOAL_A) < 1
+                                            else NavigationState.TO_GOAL_B)
+            
+            # -------------------------------------------------------------
+            # 4. 局部规划 + 控制
+            # -------------------------------------------------------------
+            path = self.path_manager.get_remaining_path()
+            
+            if path and not path.is_empty:
+                # 使用 DWA 计算速度
+                target_point = self._get_target_point(path)
+                cmd = self.dwa_planner.compute_velocity(
+                    robot_state, target_point, path, obstacles
+                )
+                vx, vw = cmd.vx, cmd.vw
+                
+                # 更新路径点
+                self._update_waypoint(robot_pos, path)
+                
+                # 调试：显示目标点
+                if self.frame_count % 10 == 0:
+                    print(f"  -> 跟踪路径点: ({target_point.x:.0f}, {target_point.y:.0f}), "
+                          f"路径剩余: {len(path)} 点")
+            else:
+                # 直接控制到目标
+                vx, vw = self.motion_controller.compute_command_to_point(
+                    robot_pos, robot_heading, Point(goal[0], goal[1])
+                )
+                
+                if self.frame_count % 10 == 0:
+                    print(f"  -> 直接控制到目标: ({goal[0]:.0f}, {goal[1]:.0f})")
+        
+        # -----------------------------------------------------------------
+        # 5. 到达检测
+        # -----------------------------------------------------------------
+        distance_to_goal = euclidean_distance(robot_pos, goal)
+        
+        if distance_to_goal < self.cfg.goal.ARRIVAL_THRESHOLD:
+            print(f"[帧 {self.frame_count}] 到达目标! 切换中...")
+            self.state_machine.switch_goal()
+            self.path_manager.current_path = None
+            self.motion_controller.reset()
+            self.stuck_detector.reset()
+            
+            # 原地旋转一下
+            vx, vw = self.motion_controller.rotation_command()
+            self.action.sendCommand(vx=vx, vw=vw)
+            time.sleep(0.3)
+            return
+        
+        # -----------------------------------------------------------------
+        # 6. 卡住检测
+        # -----------------------------------------------------------------
+        if self.stuck_detector.update(robot_pos):
+            print(f"[帧 {self.frame_count}] 检测到卡住，触发重规划")
+            self.path_manager.current_path = None
+            self.stuck_detector.reset()
+        
+        # -----------------------------------------------------------------
+        # 7. 执行命令
+        # -----------------------------------------------------------------
+        self.action.sendCommand(vx=vx, vw=vw)
+        
+        # 调试输出
+        if self.frame_count % 10 == 0:
+            print(f"[帧 {self.frame_count}] 位置: ({robot.x:.0f}, {robot.y:.0f}), "
+                  f"朝向: {math.degrees(robot_heading):.1f}°, "
+                  f"速度: vx={vx:.0f}, vw={vw:.2f}, "
+                  f"到目标距离: {distance_to_goal:.0f}")
+        
+        # -----------------------------------------------------------------
+        # 8. 调试可视化
+        # -----------------------------------------------------------------
+        self._send_debug_info(robot_pos, goal, obstacles)
+    
+    def _get_target_point(self, path: Path) -> Point:
+        """获取目标跟踪点"""
+        if path.is_empty:
+            return Point(0, 0)
+        
+        # 取路径上较远的点作为目标
+        robot = self.vision.my_robot
+        robot_pos = np.array([robot.x, robot.y])
+        
+        lookahead = min(800, self.motion_controller.current_vx * 0.3 + 300)
+        
+        for point in path:
+            if euclidean_distance(robot_pos, point.to_array()) >= lookahead:
+                return point
+        
+        return path.end
+    
+    def _update_waypoint(self, robot_pos: np.ndarray, path: Path):
+        """更新路径点索引"""
+        if path.is_empty:
+            return
+        
+        current_wp = self.path_manager.get_current_waypoint()
+        if current_wp:
+            dist = euclidean_distance(robot_pos, current_wp.to_array())
+            if dist < self.cfg.pure_pursuit.WAYPOINT_THRESHOLD:
+                self.path_manager.advance_waypoint()
+    
+    def _send_debug_info(self, robot_pos: np.ndarray, goal: np.ndarray, 
+                         obstacles: list):
+        """发送调试信息"""
+        package = Debug_Msgs()
+        
+        # 绘制机器人位置
+        self.debugger.draw_circle(package, robot_pos[0], robot_pos[1])
+        
+        # 绘制目标点
+        self.debugger.draw_circle(package, goal[0], goal[1])
+        
+        # 绘制路径
+        if self.path_manager.current_path:
+            path_x, path_y = self.path_manager.get_path_arrays()
+            if path_x and path_y:
+                self.debugger.draw_finalpath(package, path_x, path_y)
+        
+        # 发送
+        self.debugger.send(package)
+
+
+# =============================================================================
+# 主函数
+# =============================================================================
+
 def main():
     """主函数"""
-    # =========================================================================
-    # 初始化
-    # =========================================================================
-    # 感知与通信模块
-    vision = Vision()
-    action = Action()
-    debugger = Debugger()
-    # 导航与运动控制
-    navigator = Navigator()
-    motion_ctrl = MotionController()
-    pos_tracker = PositionTracker()
-    # 启动阶段标志
-    is_startup = True
-    # =========================================================================
-    # 主循环
-    # =========================================================================
-    while True:
-        # ---------------------------------------------------------------------
-        # 1. 获取机器人状态
-        # ---------------------------------------------------------------------
-        robot = vision.my_robot
-        robot_pos = np.array([robot.x, robot.y])
-        last_pos = pos_tracker.last_position
-        # 记录位置
-        pos_tracker.update(robot_pos)
-        # 等待一帧
-        time.sleep(0.01)
-        # ---------------------------------------------------------------------
-        # 2. 计算导航方向
-        # ---------------------------------------------------------------------
-        # 获取当前目标
-        goal = navigator.get_current_goal()
-        # 计算势场合力
-        force = navigator.compute_navigation_force(robot_pos, vision)
-        # 启动阶段不移动
-        if is_startup:
-            force = np.array([0.0, 0.0])
-            is_startup = False
-        # 放大力度作为期望速度
-        target_velocity = force * 500
-        # ---------------------------------------------------------------------
-        # 3. 计算控制命令
-        # ---------------------------------------------------------------------
-        # 计算朝向
-        if last_pos is not None:
-            current_heading = motion_ctrl.estimate_heading(robot_pos, last_pos)
-        else:
-            current_heading = None
-        target_heading = vector_to_angle(target_velocity)
-        # 计算速度命令
-        if current_heading is not None:
-            # 计算角度误差
-            heading_error = normalize_angle(target_heading - current_heading)
-            cmd = motion_ctrl.compute_velocity_from_error(target_velocity, heading_error)
-            # 调试输出
-            print(f"目标朝向: {target_heading:.2f}, 当前朝向: {current_heading:.2f}, 误差: {heading_error:.2f}")
-        else:
-            cmd = motion_ctrl.stop_command()
-        # ---------------------------------------------------------------------
-        # 4. 状态切换与脱困处理
-        # ---------------------------------------------------------------------
-        if navigator.is_escaping():
-            # 脱困状态：检查是否完成
-            if navigator.check_escape_complete(robot_pos):
-                navigator.end_escape()
-        elif navigator.check_arrival(robot_pos):
-            # 到达目标：切换目标点
-            navigator.switch_goal()
-            cmd = motion_ctrl.rotation_command()
-            action.sendCommand(vx=cmd.vx, vw=cmd.vw)
-            time.sleep(0.2)
-        elif pos_tracker.check_stuck(threshold=10, min_count=200):
-            # 卡住：启动脱困规划
-            if navigator.start_escape(vision, robot_pos):
-                cmd = motion_ctrl.rotation_command(direction=-1)
-                pos_tracker.reset_stuck_count()
-        # ---------------------------------------------------------------------
-        # 5. 发送控制命令
-        # ---------------------------------------------------------------------
-        if not is_startup:
-            action.sendCommand(vx=cmd.vx, vw=cmd.vw)
-        # ---------------------------------------------------------------------
-        # 6. 调试可视化
-        # ---------------------------------------------------------------------
-        package = Debug_Msgs()
-        # 绘制机器人位置
-        debugger.draw_circle(package, robot.x, robot.y)
-        # 绘制目标点
-        debugger.draw_circle(package, goal[0], goal[1])
-        # 脱困状态时绘制路径
-        if navigator.is_escaping() and len(navigator.path_x) > 0:
-            debugger.draw_finalpath(package, navigator.path_x, navigator.path_y)
-        debugger.send(package)
-        # 控制循环频率
-        time.sleep(0.005)
+    controller = NavigationController()
+    controller.run()
+
 
 if __name__ == '__main__':
     main()
