@@ -165,6 +165,252 @@ class Debugger(object):
         package = Debug_Msgs()
         self.sock.sendto(package.SerializeToString(), self.debug_address)
     
+    def create_astar_visual_callback(self, start_x, start_y, goal_x, goal_y):
+        """创建 A* 规划过程的可视化回调函数"""
+        
+        def visual_callback(event, data):
+            package = Debug_Msgs()
+            
+            if event == 'grid_map':
+                # 显示网格地图（障碍物分布）
+                grid_map = data['grid_map']
+                resolution = data['resolution']
+                minx = data['minx']
+                miny = data['miny']
+                
+                # 绘制障碍物区域（红色点表示障碍物网格）
+                obstacle_points_x = []
+                obstacle_points_y = []
+                
+                # 采样显示，避免数据量过大
+                step = max(1, grid_map.shape[0] // 60)
+                for i in range(0, grid_map.shape[0], step):
+                    for j in range(0, grid_map.shape[1], step):
+                        if grid_map[i, j] == 1:
+                            wx = minx + j * resolution + resolution / 2
+                            wy = miny + i * resolution + resolution / 2
+                            obstacle_points_x.append(wx)
+                            obstacle_points_y.append(wy)
+                
+                # 绘制障碍物点（红色）
+                if obstacle_points_x:
+                    self.draw_points(package, obstacle_points_x, obstacle_points_y, Debug_Msg.RED)
+                
+                # 绘制起点（蓝色）
+                self.draw_point(package, start_x, start_y, Debug_Msg.BLUE)
+                
+                # 绘制目标点（绿色）
+                self.draw_point(package, goal_x, goal_y, Debug_Msg.GREEN)
+                
+            elif event == 'searching':
+                # 显示搜索过程
+                visited = data['visited']
+                open_set = data['open_set']
+                current = data['current']
+                grid_map = data['grid_map']
+                iteration = data['iteration']
+                start = data['start']
+                goal = data['goal']
+                resolution = self.grid_resolution if hasattr(self, 'grid_resolution') else 100
+                
+                # 绘制已访问节点（白色）
+                visited_list = list(visited)
+                if len(visited_list) > 200:
+                    visited_list = visited_list[::len(visited_list)//200]
+                
+                for (gx, gy) in visited_list:
+                    wx = data.get('minx', -4500) + gx * resolution
+                    wy = data.get('miny', -3000) + gy * resolution
+                    msg = package.msgs.add()
+                    msg.type = Debug_Msg.LINE
+                    msg.color = Debug_Msg.WHITE
+                    line = msg.line
+                    line.start.x = wx
+                    line.start.y = wy
+                    line.end.x = wx
+                    line.end.y = wy
+                    line.FORWARD = True
+                    line.BACK = True
+                
+                # 绘制开放集（黄色）
+                open_list = list(open_set)
+                if len(open_list) > 100:
+                    open_list = open_list[::len(open_list)//100]
+                
+                for (gx, gy) in open_list:
+                    wx = data.get('minx', -4500) + gx * resolution
+                    wy = data.get('miny', -3000) + gy * resolution
+                    msg = package.msgs.add()
+                    msg.type = Debug_Msg.LINE
+                    msg.color = Debug_Msg.YELLOW
+                    line = msg.line
+                    line.start.x = wx + 30
+                    line.start.y = wy + 30
+                    line.end.x = wx - 30
+                    line.end.y = wy - 30
+                    line.FORWARD = True
+                    line.BACK = True
+                
+                # 当前节点（橙色高亮）
+                cx, cy = current
+                wx = data.get('minx', -4500) + cx * resolution
+                wy = data.get('miny', -3000) + cy * resolution
+                msg = package.msgs.add()
+                msg.type = Debug_Msg.LINE
+                msg.color = Debug_Msg.CYAN
+                line = msg.line
+                line.start.x = wx + 60
+                line.start.y = wy + 60
+                line.end.x = wx - 60
+                line.end.y = wy - 60
+                line.FORWARD = True
+                line.BACK = True
+                
+                # 起点和目标点
+                self.draw_point(package, start_x, start_y, Debug_Msg.BLUE)
+                self.draw_point(package, goal_x, goal_y, Debug_Msg.GREEN)
+                
+            elif event == 'search_complete':
+                # 搜索完成，显示完整搜索树
+                came_from = data['came_from']
+                path = data['path']
+                visited = data['visited']
+                
+                resolution = self.grid_resolution if hasattr(self, 'grid_resolution') else 100
+                minx = data.get('minx', -4500)
+                miny = data.get('miny', -3000)
+                
+                # 绘制搜索树（白色细线）
+                edge_count = 0
+                max_edges = 200
+                for node, parent in came_from.items():
+                    if edge_count >= max_edges:
+                        break
+                    nx, ny = node
+                    px, py = parent
+                    msg = package.msgs.add()
+                    msg.type = Debug_Msg.LINE
+                    msg.color = Debug_Msg.WHITE
+                    line = msg.line
+                    line.start.x = minx + nx * resolution
+                    line.start.y = miny + ny * resolution
+                    line.end.x = minx + px * resolution
+                    line.end.y = miny + py * resolution
+                    line.FORWARD = True
+                    line.BACK = True
+                    edge_count += 1
+                
+                # 绘制路径（绿色）
+                if len(path) > 1:
+                    path_x, path_y = [], []
+                    for (gx, gy) in path:
+                        path_x.append(minx + gx * resolution)
+                        path_y.append(miny + gy * resolution)
+                    self.draw_finalpath(package, path_x, path_y, Debug_Msg.GREEN)
+                
+                # 起点和目标点
+                self.draw_point(package, start_x, start_y, Debug_Msg.BLUE)
+                self.draw_point(package, goal_x, goal_y, Debug_Msg.GREEN)
+                
+            elif event == 'path_found':
+                # 显示找到的原始路径
+                path_x = data['path_x']
+                path_y = data['path_y']
+                
+                # 绘制原始路径（黄色）
+                self.draw_finalpath(package, path_x, path_y, Debug_Msg.YELLOW)
+                
+                # 路径节点
+                self.draw_points(package, path_x, path_y, Debug_Msg.WHITE)
+                
+                # 起点和目标点
+                self.draw_point(package, start_x, start_y, Debug_Msg.BLUE)
+                self.draw_point(package, goal_x, goal_y, Debug_Msg.GREEN)
+                
+            elif event == 'path_smoothed':
+                # 显示平滑前后的路径对比
+                smoothed_x = data['path_x']
+                smoothed_y = data['path_y']
+                original_x = data.get('original_x', [])
+                original_y = data.get('original_y', [])
+                
+                # 绘制原始路径（黄色虚线效果 - 通过间隔绘制实现）
+                if len(original_x) > 1:
+                    for i in range(0, len(original_x) - 1, 2):
+                        msg = package.msgs.add()
+                        msg.type = Debug_Msg.LINE
+                        msg.color = Debug_Msg.YELLOW
+                        line = msg.line
+                        line.start.x = original_x[i]
+                        line.start.y = original_y[i]
+                        line.end.x = original_x[i + 1]
+                        line.end.y = original_y[i + 1]
+                        line.FORWARD = True
+                        line.BACK = True
+                
+                # 绘制平滑后路径（绿色）
+                self.draw_finalpath(package, smoothed_x, smoothed_y, Debug_Msg.GREEN)
+                
+                # 平滑后路径节点
+                self.draw_points(package, smoothed_x, smoothed_y, Debug_Msg.WHITE)
+                
+                # 起点和目标点
+                self.draw_point(package, start_x, start_y, Debug_Msg.BLUE)
+                self.draw_point(package, goal_x, goal_y, Debug_Msg.GREEN)
+                
+            elif event == 'final_result':
+                # 最终结果
+                path_x = data['path_x']
+                path_y = data['path_y']
+                
+                # 绘制最终路径（绿色加粗）
+                for i in range(len(path_x) - 1):
+                    # 绘制两次实现加粗效果
+                    self.draw_line(package, path_x[i], path_y[i], 
+                                  path_x[i+1], path_y[i+1], Debug_Msg.GREEN)
+                    self.draw_line(package, path_x[i], path_y[i], 
+                                  path_x[i+1], path_y[i+1], Debug_Msg.GREEN)
+                
+                # 路径节点（白色）
+                for i in range(len(path_x)):
+                    msg = package.msgs.add()
+                    msg.type = Debug_Msg.LINE
+                    msg.color = Debug_Msg.WHITE
+                    line = msg.line
+                    line.start.x = path_x[i] + 60
+                    line.start.y = path_y[i] + 60
+                    line.end.x = path_x[i] - 60
+                    line.end.y = path_y[i] - 60
+                    line.FORWARD = True
+                    line.BACK = True
+                    
+                    msg = package.msgs.add()
+                    msg.type = Debug_Msg.LINE
+                    msg.color = Debug_Msg.WHITE
+                    line = msg.line
+                    line.start.x = path_x[i] - 60
+                    line.start.y = path_y[i] + 60
+                    line.end.x = path_x[i] + 60
+                    line.end.y = path_y[i] - 60
+                    line.FORWARD = True
+                    line.BACK = True
+                
+                # 起点（蓝色大点）
+                self.draw_point(package, start_x, start_y, Debug_Msg.BLUE)
+                
+                # 目标点（红色大点）
+                self.draw_point(package, goal_x, goal_y, Debug_Msg.RED)
+            
+            # 发送数据包
+            try:
+                self.sock.sendto(package.SerializeToString(), self.debug_address)
+            except OSError:
+                pass
+            
+            time.sleep(0.03)
+        
+        return visual_callback
+
     def create_visual_callback(self, start_x, start_y, goal_x, goal_y):
         """创建可视化回调函数，用于RRT*规划过程的实时可视化"""
         import math

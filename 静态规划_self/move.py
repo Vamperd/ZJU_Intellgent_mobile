@@ -68,11 +68,19 @@ class Move(object):
         current_x, current_y = vision.my_robot.x, vision.my_robot.y
         # 计算当前点与下一个目标点的距离
         dist_error1 = cal_dist(current_x,current_y, path_x[Next_point_index], path_y[Next_point_index])
-        # 计算当前位置与上一个目标点的距离
+        # 计算当前位置与相邻目标点的距离（用于平滑误差跳变）
         if direction == 1:
-            dist_error2 = cal_dist(current_x,current_y, path_x[Next_point_index+1], path_y[Next_point_index+1])
+            # 正向移动：检查是否有下一个点
+            if Next_point_index + 1 < len(path_x):
+                dist_error2 = cal_dist(current_x,current_y, path_x[Next_point_index+1], path_y[Next_point_index+1])
+            else:
+                dist_error2 = dist_error1  # 边界情况，直接使用当前距离
         else:
-            dist_error2 = cal_dist(current_x,current_y, path_x[Next_point_index-1], path_y[Next_point_index-1])
+            # 反向移动：检查是否有上一个点
+            if Next_point_index - 1 >= 0:
+                dist_error2 = cal_dist(current_x,current_y, path_x[Next_point_index-1], path_y[Next_point_index-1])
+            else:
+                dist_error2 = dist_error1  # 边界情况，直接使用当前距离
         # 计算当前点与下一个目标点的角度
         theta_error = cal_theta(current_x,current_y, path_x[Next_point_index], path_y[Next_point_index])
 
