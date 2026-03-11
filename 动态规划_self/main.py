@@ -1,102 +1,114 @@
-from numpy import append
+"""
+机器人导航主程序
+实现机器人在动态环境中的实时导航、避障与脱困规划。
+采用 APF 人工势场法进行局部导航，PRM 概率路网进行脱困规划。
+"""
+import time
+import numpy as np
+
 from vision import Vision
 from action import Action
 from debug import Debugger
-import numpy as np
+from plan import Navigator, vector_to_angle, normalize_angle
+from move import MotionController, PositionTracker
 from zss_debug_pb2 import Debug_Msgs
-from prm import PRM
-import time
-from func import Force,angle
-import pid
-
-goal = np.array([-2400,-1500])
-flag=1
-count = 0
-w_real = -3.14
-recode = np.array([0,0])
-repeat=0
-
+def main():
+    """主函数"""
+    # =========================================================================
+    # 初始化
+    # =========================================================================
+    # 感知与通信模块
+    vision = Vision()
+    action = Action()
+    debugger = Debugger()
+    # 导航与运动控制
+    navigator = Navigator()
+    motion_ctrl = MotionController()
+    pos_tracker = PositionTracker()
+    # 启动阶段标志
+    is_startup = True
+    # =========================================================================
+    # 主循环
+    # =========================================================================
+    while True:
+        # ---------------------------------------------------------------------
+        # 1. 获取机器人状态
+        # ---------------------------------------------------------------------
+        robot = vision.my_robot
+        robot_pos = np.array([robot.x, robot.y])
+        last_pos = pos_tracker.last_position
+        # 记录位置
+        pos_tracker.update(robot_pos)
+        # 等待一帧
+        time.sleep(0.01)
+        # ---------------------------------------------------------------------
+        # 2. 计算导航方向
+        # ---------------------------------------------------------------------
+        # 获取当前目标
+        goal = navigator.get_current_goal()
+        # 计算势场合力
+        force = navigator.compute_navigation_force(robot_pos, vision)
+        # 启动阶段不移动
+        if is_startup:
+            force = np.array([0.0, 0.0])
+            is_startup = False
+        # 放大力度作为期望速度
+        target_velocity = force * 500
+        # ---------------------------------------------------------------------
+        # 3. 计算控制命令
+        # ---------------------------------------------------------------------
+        # 计算朝向
+        if last_pos is not None:
+            current_heading = motion_ctrl.estimate_heading(robot_pos, last_pos)
+        else:
+            current_heading = None
+        target_heading = vector_to_angle(target_velocity)
+        # 计算速度命令
+        if current_heading is not None:
+            # 计算角度误差
+            heading_error = normalize_angle(target_heading - current_heading)
+            cmd = motion_ctrl.compute_velocity_from_error(target_velocity, heading_error)
+            # 调试输出
+            print(f"目标朝向: {target_heading:.2f}, 当前朝向: {current_heading:.2f}, 误差: {heading_error:.2f}")
+        else:
+            cmd = motion_ctrl.stop_command()
+        # ---------------------------------------------------------------------
+        # 4. 状态切换与脱困处理
+        # ---------------------------------------------------------------------
+        if navigator.is_escaping():
+            # 脱困状态：检查是否完成
+            if navigator.check_escape_complete(robot_pos):
+                navigator.end_escape()
+        elif navigator.check_arrival(robot_pos):
+            # 到达目标：切换目标点
+            navigator.switch_goal()
+            cmd = motion_ctrl.rotation_command()
+            action.sendCommand(vx=cmd.vx, vw=cmd.vw)
+            time.sleep(0.2)
+        elif pos_tracker.check_stuck(threshold=10, min_count=200):
+            # 卡住：启动脱困规划
+            if navigator.start_escape(vision, robot_pos):
+                cmd = motion_ctrl.rotation_command(direction=-1)
+                pos_tracker.reset_stuck_count()
+        # ---------------------------------------------------------------------
+        # 5. 发送控制命令
+        # ---------------------------------------------------------------------
+        if not is_startup:
+            action.sendCommand(vx=cmd.vx, vw=cmd.vw)
+        # ---------------------------------------------------------------------
+        # 6. 调试可视化
+        # ---------------------------------------------------------------------
+        package = Debug_Msgs()
+        # 绘制机器人位置
+        debugger.draw_circle(package, robot.x, robot.y)
+        # 绘制目标点
+        debugger.draw_circle(package, goal[0], goal[1])
+        # 脱困状态时绘制路径
+        if navigator.is_escaping() and len(navigator.path_x) > 0:
+            debugger.draw_finalpath(package, navigator.path_x, navigator.path_y)
+        debugger.send(package)
+        # 控制循环频率
+        time.sleep(0.005)
 
 if __name__ == '__main__':
-	vision = Vision()
-	action = Action()
-	debugger = Debugger()
-	planner = PRM()
-	w_pid = pid.PID()
-	while True:
-		# 1. path planning & velocity planning
-		# Do something
-		robot = vision.my_robot
-		robot_last_x = robot.x
-		robot_last_y = robot.y
-		recode=np.array([robot_last_x,robot_last_y])
-		time.sleep(0.01)
-		if flag==1:
-			goal = np.array([-2400,-1500])
-		elif flag == -1:
-			goal = np.array([2400,1500])
-		F = Force([robot.x,robot.y],vision,goal)
-		d_goal = np.linalg.norm(np.array([robot.x,robot.y]) - goal)
-		if count == 0:
-			F = np.array([0,0])
-			count = 1
-		else:
-			count = 2
-		totalv = F * 500
-		v_real = [robot.x-robot_last_x,robot.y-robot_last_y]
-		if v_real[0]!=0:
-			w_real = angle(v_real)
-		w_expect = angle(totalv)
-		err = w_expect - w_real
-		if err > np.pi:
-			err = err - np.pi*2
-		elif err <-np.pi:
-			err = err + np.pi*2
-		w_pid.SetPoint = 0
-		pid.PID.update(w_pid,err)
-		print(w_expect,w_real,err)
-		if flag == 0:
-			if d_goal < d_prm:
-				flag = _flag
-		elif d_goal<100:
-			flag = -1*flag
-			action.sendCommand(vx=0, vw=10)
-			time.sleep(0.2)
-		# 2. send command
-		if count == 2:
-			action.sendCommand(vx=np.linalg.norm(totalv)*2/(1+2*abs(w_pid.output)), vw=-w_pid.output*10)
-		d_move=np.linalg.norm(np.array([vision.my_robot.x,vision.my_robot.y]) - recode)
-		if d_move<10:
-			repeat += 1
-			if repeat > 200:
-				path_x, path_y, road_map, sample_x, sample_y = planner.plan(vision=vision,
-																			start_x=vision.my_robot.x,
-																			start_y=vision.my_robot.y,
-																			goal_x=goal[0],
-																			goal_y=goal[1])
-				l=len(path_x)
-				goal=np.array([path_x[l-2],path_y[l-2]])
-				action.sendCommand(vx=0, vw=-w_pid.output*10)
-				#d_prm是状态结束时离目标点goal的距离
-				d_prm=np.linalg.norm(recode - goal)/2
-				if d_prm < 300:#目标点过近无法摆脱自锁状态
-					d_prm = 999999
-				elif d_prm < 1000:#目标点较近时，需要状态结束时离目标点更近一点
-					d_prm = 500
-				if flag != 0 :
-					_flag=flag
-				flag=0
-				repeat=0
-		else:
-			repeat=0
-
-
-		# 3. draw debug msg
-		package = Debug_Msgs()
-		debugger.draw_circle(package, vision.my_robot.x, vision.my_robot.y)
-		if flag==0:
-			debugger.draw_finalpath(package, path_x, path_y)
-		debugger.draw_circle(package,goal[0],goal[1])
-		debugger.send(package)
-
-		time.sleep(0.005)
+    main()
